@@ -1,4 +1,4 @@
-"""Offline contract tests for observability V8, without Kafka or Docker."""
+"""Offline contract tests for observability, without Kafka or Docker."""
 import importlib.util
 import os
 from pathlib import Path
@@ -22,7 +22,7 @@ except ImportError:
     admin.OffsetSpec=types.SimpleNamespace(latest=lambda:'latest')
     sys.modules['confluent_kafka']=mod
     sys.modules['confluent_kafka.admin']=admin
-spec=importlib.util.spec_from_file_location('v8mon', root/'app/monitor.py')
+spec=importlib.util.spec_from_file_location('mon', root/'app/monitor.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 
@@ -114,4 +114,4 @@ def test_permissions_and_protocol():
 if __name__=='__main__':
     for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,test_permissions_and_protocol):
         test()
-    print('PASS V8 full health: coverage, alerts, readonly, SQL, UI')
+    print('PASS full health: coverage, alerts, readonly, SQL, UI')

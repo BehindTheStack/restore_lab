@@ -191,7 +191,7 @@ GRANT USAGE ON SCHEMA replica TO monitor_reader;
 GRANT SELECT ON replica.active_state, replica.transitions, replica.sync_runs,
   replica.schema_state TO monitor_reader;
 
--- V8 audit of completed PK intervals, stored transactionally with promotion.
+-- Audit of completed PK intervals, stored transactionally with promotion.
 ALTER TABLE replica.sync_runs ADD COLUMN source_engine TEXT;
 ALTER TABLE replica.sync_runs ADD COLUMN sweep_target_max_id BIGINT;
 CREATE TABLE replica.range_checkpoints (
@@ -210,6 +210,6 @@ GRANT SELECT ON replica.active_state, replica.transitions, replica.sync_runs,
     replica.schema_backfill_intervals, replica.source_catalog_observations
     TO monitor_reader;
 
--- Keeps the V8 20s polling inexpensive even after many runs.
+-- Keeps the monitor 20s polling inexpensive even after many runs.
 CREATE INDEX IF NOT EXISTS sync_runs_started_idx ON replica.sync_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS sync_runs_status_finished_idx ON replica.sync_runs(status,finished_at DESC);

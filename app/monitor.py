@@ -1,4 +1,4 @@
-"""V8: read-only, evidence-based, end-to-end reconciliation observability.
+"""Monitor Kafka restore lab.
 
 No remote credentials, no Docker socket, no Kafka consumer group membership,
 no writes and no external telemetry stack. Source reachability is INDIRECT.
@@ -425,7 +425,7 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 @media(max-width:900px){{.stages{{grid-template-columns:repeat(2,1fr)}}.columns{{grid-template-columns:1fr}}}}
 @media(max-width:520px){{main{{padding:19px 12px}}.stages{{grid-template-columns:1fr 1fr}}.stage{{min-height:130px}}}}
 </style></head><body><main>
-<header><div><div class="top">KAFKA RESTORE LAB · V8 / OPERAÇÃO</div>
+<header><div><div class="top">KAFKA RESTORE LAB / OPERAÇÃO</div>
 <h1>Saúde da reconciliação de dados</h1>
 <p>PostgreSQL ou SQL Server → Python → Kafka → Consumer → PostgreSQL blue-green<br>
 Última leitura: {_safe(s['checked_at'])} · Atualização automática a cada 20 segundos</p></div>
@@ -558,5 +558,5 @@ if __name__=='__main__':
     if not (1<=PORT<=65535 and STALLED_MIN>0 and COVERAGE_HOURS>0 and MAX_LAG>=0
             and 0<=EXPECTED_INTERVAL_MIN and 100<=MAX_RANGES<=100000):
         raise ValueError('Invalid monitoring configuration')
-    print(f'V8 monitoring http://0.0.0.0:{PORT} (Compose exposes loopback only)',flush=True)
+    print(f'monitoring http://0.0.0.0:{PORT} (Compose exposes loopback only)',flush=True)
     ThreadingHTTPServer(('0.0.0.0',PORT),Handler).serve_forever()
