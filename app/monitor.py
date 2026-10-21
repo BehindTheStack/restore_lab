@@ -9,7 +9,7 @@ import html
 import json
 import os
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from uuid import UUID
@@ -358,6 +358,11 @@ def render_html(s):
     m=s.get('metrics') or {}; c=s.get('coverage') or {}; schema=s.get('schema') or {}
     catalog=s.get('catalog') or []; runs=s.get('recent_runs') or []
     last=s.get('last_transition') or {}
+    checked_at=datetime.fromisoformat(s['checked_at'])
+    if checked_at.tzinfo is None:
+        checked_at=checked_at.replace(tzinfo=timezone.utc)
+    local_reading=checked_at.astimezone(timezone(timedelta(hours=-3)))
+    reading_label=local_reading.strftime('%d/%m/%Y às %H:%M:%S')
     state_label={'operational':'Serviços prontos · integridade por faixas',
                  'attention':'Atenção operacional','not_initialized':'Bootstrap pendente',
                  'unavailable':'Falha operacional'}[s['overall']]
@@ -415,8 +420,20 @@ def render_html(s):
 *{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--bg);font:14px system-ui,Arial,sans-serif;color:var(--ink)}}
 a{{color:var(--link)}}main{{max-width:1380px;margin:auto;padding:32px 24px 50px}}
 header{{display:flex;align-items:start;justify-content:space-between;gap:20px;flex-wrap:wrap}}
+.header-main{{flex:1 1 700px;min-width:0}}
 h1{{font-size:27px;margin:3px 0 7px}}h2{{font-size:17px;margin:0 0 13px}}p{{color:var(--muted);line-height:1.55;margin:7px 0}}
 .top{{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.08em}}
+.pipeline{{display:flex;align-items:center;flex-wrap:wrap;gap:7px;list-style:none;padding:0;margin:14px 0}}
+.pipeline li{{display:flex;align-items:center;gap:7px;font-size:12px}}
+.pipeline-node{{border:1px solid var(--line);border-radius:8px;background:var(--paper);padding:6px 9px;white-space:nowrap}}
+.pipeline-node.transport{{background:#edf2f8;border-color:#cfdaea;color:var(--link);font-weight:600}}
+.pipeline-arrow{{color:#8b9bad;font-size:14px}}
+.header-meta{{display:flex;align-items:center;flex-wrap:wrap;gap:8px 20px;color:var(--muted);font-size:12px;line-height:1.6}}
+.reading{{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px}}
+.reading time{{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}}
+.reading small{{font-size:11px;color:var(--muted)}}
+.refresh{{display:inline-flex;align-items:center;gap:7px}}
+.refresh-dot{{width:6px;height:6px;border-radius:50%;background:var(--link)}}
 .state{{border:1px solid var(--line);background:#fff;padding:11px 15px;border-radius:24px;font-weight:700}}
 .summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin:21px 0}}
 .card,.section{{border:1px solid var(--line);background:var(--paper);border-radius:13px;padding:18px}}
@@ -437,10 +454,19 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 @media(max-width:900px){{.stages{{grid-template-columns:repeat(2,1fr)}}.columns{{grid-template-columns:1fr}}}}
 @media(max-width:520px){{main{{padding:19px 12px}}.stages{{grid-template-columns:1fr 1fr}}.stage{{min-height:130px}}}}
 </style></head><body><main>
-<header><div><div class="top">KAFKA RESTORE LAB / OPERAÇÃO</div>
+<header><div class="header-main"><div class="top">KAFKA RESTORE LAB / OPERAÇÃO</div>
 <h1>Saúde da reconciliação de dados</h1>
-<p>PostgreSQL ou SQL Server → Python → Kafka → Consumer → PostgreSQL blue-green<br>
-Última leitura: {_safe(s['checked_at'])} · Atualização automática a cada 20 segundos</p></div>
+<ol class="pipeline" aria-label="Fluxo de reconciliação">
+<li><span class="pipeline-node">PostgreSQL ou SQL Server</span></li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">Python</span></li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node transport">Kafka</span></li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">Consumer</span></li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">PostgreSQL blue-green</span></li>
+</ol>
+<div class="header-meta">
+<span class="reading">Última leitura <time datetime="{_safe(s['checked_at'])}">{_safe(reading_label)}</time><small>UTC−03 · Fortaleza</small></span>
+<span class="refresh"><span class="refresh-dot" aria-hidden="true"></span>Atualização automática · a cada 20 segundos</span>
+</div></div>
 <div class="state">{_safe(state_label)}</div></header>
 <div class="summary">
 <div class="card"><label>Última promoção</label><strong>{_safe(m.get('last_success_age_seconds'))} s</strong><small>Idade da promoção, não da origem</small></div>
