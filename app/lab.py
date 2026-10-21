@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -372,6 +373,7 @@ def poll(mode, sweep_width=1000, batch_size=250, throttle_ms=0, from_id=None):
                     range_high=scan_high,observed_remote_keys=key_count,
                     changed_payloads=d_count,delete_candidates=len(missing_ids),
                     bytes_json=bytes_sent,duration_s=round(time.monotonic()-started,2))
+                return run_id
         except Exception as exc:
             log('producer_failed',run_id=run_id,error=str(exc))
             if started_event:
@@ -1118,6 +1120,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('bootstrap')
+    init = sub.add_parser('initialize', help='Prepare proxy and bootstrap only an empty destination')
+    init.add_argument('--ready-timeout', type=int, default=60)
+    init.add_argument('--promotion-timeout', type=int, default=600)
     incremental = sub.add_parser('incremental')
     incremental.add_argument('--sweep-width', type=int, default=1000)
     incremental.add_argument('--from-id', type=int, default=None,
@@ -1175,7 +1180,22 @@ def main():
     mu.add_argument('op', choices=['insert','update','hard-delete'])
     mu.add_argument('id', type=int)
     args = parser.parse_args()
-    if args.command == 'bootstrap':
+    if args.command == 'initialize':
+        if args.ready_timeout < 1 or args.promotion_timeout < 1:
+            parser.error('ready-timeout>=1; promotion-timeout>=1')
+        from startup import initialize
+        if REMOTE_ENGINE == 'sqlserver':
+            import mssql_sync
+            prepare_proxy = mssql_sync.ensure_proxy
+            publish_bootstrap = lambda: mssql_sync.poll('bootstrap')
+        else:
+            prepare_proxy = ensure_proxy
+            publish_bootstrap = lambda: poll('bootstrap')
+        initialize(lambda: psycopg.connect(LOCAL, autocommit=True),
+                   prepare_proxy, publish_bootstrap, log,
+                   ready_timeout=args.ready_timeout,
+                   promotion_timeout=args.promotion_timeout)
+    elif args.command == 'bootstrap':
         if REMOTE_ENGINE == 'sqlserver':
             import mssql_sync
             mssql_sync.poll('bootstrap')
@@ -1223,7 +1243,15 @@ def main():
     elif args.command == 'schedule':
         if args.interval < 1 or args.sweep_width < 1:
             parser.error('interval>=1; sweep-width>=1')
-        while True:
+        stopping = threading.Event()
+
+        def stop_schedule(signum, frame):
+            log('scheduler_stopping', signal=signum)
+            stopping.set()
+
+        signal.signal(signal.SIGTERM, stop_schedule)
+        signal.signal(signal.SIGINT, stop_schedule)
+        while not stopping.is_set():
             try:
                 if REMOTE_ENGINE == 'sqlserver':
                     import mssql_sync
@@ -1232,7 +1260,8 @@ def main():
                     poll('incremental', sweep_width=args.sweep_width)
             except Exception as exc:
                 log('scheduled_incremental_failed', error=str(exc))
-            time.sleep(args.interval)
+            # Finish publication of the current batch before honoring shutdown.
+            stopping.wait(args.interval)
 
 
 if __name__ == '__main__':

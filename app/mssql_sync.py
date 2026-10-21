@@ -246,6 +246,7 @@ def poll(mode, sweep_width=1000, batch_size=250, throttle_ms=0, from_id=None):
                         remote_payload_json_bytes=source_payload_json_bytes,
                         kafka_bytes=kafka_bytes,
                         duration_s=round(time.monotonic()-started,2))
+                return run_id
             except Exception as exc:
                 if in_tx:
                     try:

@@ -19,7 +19,8 @@ run_and_wait(){
  await_result "SELECT status FROM replica.sync_runs ORDER BY started_at DESC LIMIT 1;" promoted
 }
 echo '[1/9] Bootstrap without remote timestamps'
-docker compose up -d --build
+# Manual batches below must run without the automatic init/scheduler.
+docker compose up -d --build remote-db local-db kafka toxiproxy consumer kafbat adminer monitor
 cli chaos init
 fixture seed --rows 1000 --description-bytes 128
 run_and_wait bootstrap

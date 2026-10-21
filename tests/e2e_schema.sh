@@ -23,7 +23,8 @@ fi
 
 echo '[1/10] Bootstrap isolated lab'
 docker compose down -v --remove-orphans
-docker compose up -d --build
+# Manual bootstrap/backfill must run without the automatic init/scheduler.
+docker compose up -d --build remote-db local-db kafka toxiproxy consumer kafbat adminer monitor
 cli chaos init
 fixture seed --rows 120 --description-bytes 128
 cli bootstrap

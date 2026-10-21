@@ -11,7 +11,7 @@ services:
       - remote_data:/var/lib/postgresql/data
       - ./sql/remote.sql:/docker-entrypoint-initdb.d/01-remote.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d lab_remote"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d lab_remote"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -51,7 +51,7 @@ services:
       - local_data:/var/lib/postgresql/data
       - ./sql/local.sql:/docker-entrypoint-initdb.d/01-local.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d lab_local"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d lab_local"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -139,6 +139,7 @@ services:
       MSSQL_DATABASE: lab_remote
     command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
     restart: unless-stopped
+    stop_grace_period: 10m
     depends_on:
       - remote-sqlserver
       - toxiproxy
@@ -170,12 +171,29 @@ services:
       remote-db:
         condition: service_healthy
 
+  init:
+    build: ./app
+    environment: *app-env
+    command: ["initialize", "--ready-timeout", "60", "--promotion-timeout", "600"]
+    restart: "no"
+    depends_on:
+      remote-db:
+        condition: service_healthy
+      local-db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      toxiproxy:
+        condition: service_started
+      consumer:
+        condition: service_started
+
   scheduler:
     build: ./app
     environment: *app-env
     command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
-    profiles: ["scheduled"]
     restart: unless-stopped
+    stop_grace_period: 10m
     depends_on:
       local-db:
         condition: service_healthy
@@ -183,11 +201,12 @@ services:
         condition: service_started
       toxiproxy:
         condition: service_started
+      init:
+        condition: service_completed_successfully
 
-  # Optional, read-only end-to-end operations UI.
+  # Read-only end-to-end operations UI, included in the default stack.
   monitor:
     build: ./app
-    profiles: ["monitor"]
     entrypoint: ["python", "-u", "/app/monitor.py"]
     environment:
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
@@ -198,7 +217,7 @@ services:
       LAB_STALLED_MINUTES: "15"
       LAB_COVERAGE_WINDOW_HOURS: "24"
       LAB_MAX_COVERAGE_INTERVALS: "20000"
-      LAB_EXPECTED_INTERVAL_MINUTES: "0" # disabled by default for on-demand labs
+      LAB_EXPECTED_INTERVAL_MINUTES: "0" # optional freshness alert; 0 disables it
       LAB_MAX_CONSUMER_LAG: "1000"
       LAB_MONITOR_PORT: "8082"
     ports:
