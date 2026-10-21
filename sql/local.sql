@@ -205,7 +205,7 @@ CREATE TABLE replica.range_checkpoints (
 );
 CREATE INDEX range_checkpoints_recent ON replica.range_checkpoints(checked_at DESC);
 GRANT SELECT ON replica.active_state, replica.transitions, replica.sync_runs,
-    replica.schema_state, replica.slot_state, replica.range_checkpoints,
+    replica.schema_state, replica.slot_state, replica.generations, replica.range_checkpoints,
     replica.schema_versions, replica.schema_changes, replica.schema_backfill_runs,
     replica.schema_backfill_intervals, replica.source_catalog_observations
     TO monitor_reader;

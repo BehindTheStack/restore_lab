@@ -109,7 +109,7 @@ def test_permissions_and_protocol():
     assert "INSERT INTO replica.range_checkpoints" in core
     assert "source_engine':'postgresql'" in core
     assert 'sweep_target_max_id' in (root/'app/mssql_sync.py').read_text()
-    assert 'CREATE TABLE IF NOT EXISTS replica.range_checkpoints' in (root/'sql/monitor_upgrade.sql').read_text()
+    assert 'CREATE TABLE replica.range_checkpoints' in (root/'sql/local.sql').read_text()
 
 if __name__=='__main__':
     for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,test_permissions_and_protocol):
