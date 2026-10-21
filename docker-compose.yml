@@ -1,0 +1,244 @@
+name: kafka-restore-lab
+services:
+  remote-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: lab-admin
+      POSTGRES_DB: lab_remote
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - remote_data:/var/lib/postgresql/data
+      - ./sql/remote.sql:/docker-entrypoint-initdb.d/01-remote.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lab_remote"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Opt-in SQL Server source for read-only DDL catalog experiments.
+  remote-sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["mssql"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: "Lab-Strong-Pass-2026!"
+    ports:
+      - "127.0.0.1:51433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+
+  mssql-fixture:
+    build: ./app
+    profiles: ["mssql-tools"]
+    entrypoint: ["python", "-u", "/app/sqlserver_fixture.py"]
+    command: ["init"]
+    environment:
+      MSSQL_HOST: remote-sqlserver
+      MSSQL_SA_PASSWORD: "Lab-Strong-Pass-2026!"
+    depends_on:
+      - remote-sqlserver
+
+  local-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: lab-admin
+      POSTGRES_DB: lab_local
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - local_data:/var/lib/postgresql/data
+      - ./sql/local.sql:/docker-entrypoint-initdb.d/01-local.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lab_local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:4.2.2
+    hostname: kafka
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'CONTROLLER://:29093,EXTERNAL://:9092,INTERNAL://:19092'
+      KAFKA_ADVERTISED_LISTENERS: 'EXTERNAL://localhost:9092,INTERNAL://kafka:19092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: '4L6g3nShT-eMCtK--X86sw'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    ports:
+      - "127.0.0.1:8474:8474"
+    depends_on:
+      remote-db:
+        condition: service_healthy
+
+  consumer:
+    build: ./app
+    environment: &app-env
+      REMOTE_DSN: "host=toxiproxy port=15432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
+      REMOTE_DIRECT_DSN: "host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
+      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=postgres password=lab-admin connect_timeout=4"
+      KAFKA_BOOTSTRAP: kafka:19092
+      KAFKA_TOPIC: lab.sync.events.v6
+      KAFKA_AUDIT_TOPIC: lab.sync.audit.v6
+      MAX_REMOVE_FRACTION: "0.20"
+      TOXIPROXY_URL: http://toxiproxy:8474
+    command: ["consume"]
+    restart: unless-stopped
+    depends_on:
+      local-db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  mssql-cli:
+    build: ./app
+    profiles: ["mssql-tools"]
+    environment:
+      <<: *app-env
+      REMOTE_ENGINE: sqlserver
+      MSSQL_HOST: toxiproxy
+      MSSQL_PORT: "15433"
+      MSSQL_USER: remote_reader
+      MSSQL_PASSWORD: lab-reader
+      MSSQL_DATABASE: lab_remote
+    depends_on:
+      local-db:
+        condition: service_healthy
+      remote-sqlserver:
+        condition: service_started
+      toxiproxy:
+        condition: service_started
+    command: ["catalog", "observe", "--engine", "sqlserver", "--source-key", "mssql-dbo-contracts"]
+
+  mssql-scheduler:
+    build: ./app
+    profiles: ["mssql-scheduled"]
+    environment:
+      <<: *app-env
+      REMOTE_ENGINE: sqlserver
+      MSSQL_HOST: toxiproxy
+      MSSQL_PORT: "15433"
+      MSSQL_USER: remote_reader
+      MSSQL_PASSWORD: lab-reader
+      MSSQL_DATABASE: lab_remote
+    command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
+    restart: unless-stopped
+    depends_on:
+      - remote-sqlserver
+      - toxiproxy
+      - local-db
+      - kafka
+
+  cli:
+    build: ./app
+    environment: *app-env
+    profiles: ["tools"]
+    depends_on:
+      local-db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      toxiproxy:
+        condition: service_started
+    command: ["status"]
+
+  seed-fixture:
+    build: ./app
+    profiles: ["tools"]
+    environment:
+      <<: *app-env
+      # ADMIN only in this synthetic fixture service; not in producer/consumer.
+      REMOTE_ADMIN_DSN: "host=remote-db port=5432 dbname=lab_remote user=postgres password=lab-admin connect_timeout=4"
+    command: ["seed"]
+    depends_on:
+      remote-db:
+        condition: service_healthy
+
+  scheduler:
+    build: ./app
+    environment: *app-env
+    command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
+    profiles: ["scheduled"]
+    restart: unless-stopped
+    depends_on:
+      local-db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      toxiproxy:
+        condition: service_started
+
+  # Optional, read-only end-to-end operations UI.
+  monitor:
+    build: ./app
+    profiles: ["monitor"]
+    entrypoint: ["python", "-u", "/app/monitor.py"]
+    environment:
+      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
+      KAFKA_BOOTSTRAP: kafka:19092
+      KAFKA_TOPIC: lab.sync.events.v6
+      KAFKA_AUDIT_TOPIC: lab.sync.audit.v6
+      LAB_CONSUMER_GROUP: lab-range-bluegreen-v4
+      LAB_STALLED_MINUTES: "15"
+      LAB_COVERAGE_WINDOW_HOURS: "24"
+      LAB_MAX_COVERAGE_INTERVALS: "20000"
+      LAB_EXPECTED_INTERVAL_MINUTES: "0" # disabled by default for on-demand labs
+      LAB_MAX_CONSUMER_LAG: "1000"
+      LAB_MONITOR_PORT: "8082"
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      local-db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz',timeout=4).read()"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
+  kafbat:
+    image: kafbat/kafka-ui:v1.5.0
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kafka-lab
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    depends_on:
+      - kafka
+
+  adminer:
+    image: adminer:5
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: local-db
+    depends_on:
+      local-db:
+        condition: service_healthy
+
+volumes:
+  remote_data:
+  local_data:
+  kafka_data:
+  mssql_data:
