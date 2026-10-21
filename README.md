@@ -526,7 +526,9 @@ docker compose run --rm cli status
 
 Se faltarem tabelas de controle ou houver inconsistência entre gerações e estado ativo, a inicialização falha e impede a subida do scheduler. Inspecione os logs e planeje o reparo SQL do volume antes de tentar novamente. Não reaplique `sql/local.sql` inteiro sobre um banco existente e não apague volumes com dados necessários.
 
-O monitor precisa de leitura em `replica.generations` para calcular a cobertura por linhagem. Instalações novas já recebem essa permissão. Se um volume existente apresentar `permission denied for table generations` no painel, aplique a concessão local:
+O monitor precisa de leitura em `replica.generations` para calcular a cobertura por linhagem. Instalações novas já recebem essa permissão, e `init` a reaplica também em volumes existentes antes de verificar a geração ativa. Erros de consulta são identificados como `LOCAL_DB_READ_ERROR`, com a causa SQL no painel; `LOCAL_DB_DOWN` indica falha de conexão.
+
+Para corrigir imediatamente um volume em execução que apresente `permission denied for table generations`, a concessão local pode ser aplicada sem reiniciar serviços:
 
 ```bash
 docker compose exec -T local-db psql -v ON_ERROR_STOP=1 -U postgres -d lab_local -c \
