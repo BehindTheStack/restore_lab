@@ -115,7 +115,13 @@ CREATE TABLE replica.schema_state (
     pending_hash TEXT REFERENCES replica.schema_versions(schema_hash),
     backfill_next BIGINT,
     backfill_max BIGINT,
-    CHECK (active_hash IS DISTINCT FROM pending_hash)
+    CONSTRAINT schema_state_hash_check CHECK (
+        pending_hash IS NULL
+        OR (
+            active_hash IS NOT NULL
+            AND active_hash <> pending_hash
+        )
+    )
 );
 INSERT INTO replica.schema_state(singleton) VALUES (TRUE);
 CREATE TABLE replica.schema_changes (

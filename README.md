@@ -1,533 +1,563 @@
-# Kafka Restore Lab V8 — Saúde consolidada da reconciliação
+# Kafka Restore Lab
 
-Esta V8 **evolui a V7 sem instalar Grafana, Prometheus, Loki ou Uptime Kuma**. Aproveita a GUI existente (`monitor`) em `http://localhost:8082`, Kafbat e Adminer. Preserva o fluxo PostgreSQL/SQL Server → Python → Kafka → PostgreSQL blue-green e suas políticas de DDL/deletes. O painel é **somente leitura**; **não acessa a origem diretamente**.
+Laboratório de reconciliação de contratos de uma origem PostgreSQL ou SQL Server para um PostgreSQL local, usando Python, Kafka e duas tabelas blue-green. O extrator lê a origem com uma conta de leitura; o consumer valida cada lote antes de disponibilizá-lo pela view `public.contracts`.
 
-## Como iniciar uma instalação nova
+O projeto demonstra carga inicial, sincronização por faixas de chave primária, detecção de exclusões físicas, rollback, inspeção de schema e testes de falhas de rede. Os bancos de origem do Compose contêm dados fictícios. O laboratório não foi homologado para produção nem para bases de centenas de gigabytes.
 
-```bash
-cd kafka_restore_lab_v8
-docker compose up -d --build
-docker compose --profile monitor up -d --build monitor
-# http://localhost:8082 — monitor V8
-# http://localhost:8080 — Kafbat
-# http://localhost:8081 — Adminer
+## Como o fluxo funciona
+
+```mermaid
+flowchart LR
+    subgraph sources["Origens alternativas"]
+        pg[("PostgreSQL remoto")]
+        mssql[("SQL Server remoto")]
+    end
+
+    pg --> proxy["Toxiproxy"]
+    mssql --> proxy
+    proxy --> extractor["Extrator Python<br/>CLI ou scheduler"]
+    extractor -->|"Eventos de dados e auditoria"| kafka["Kafka"]
+    kafka -->|"Eventos de dados"| consumer["Consumer"]
+
+    subgraph destination["PostgreSQL local"]
+        slots["Tabelas blue / green"]
+        view["View public.contracts"]
+        audit["Auditoria e checkpoints"]
+        slots -->|"Slot ativo"| view
+    end
+
+    consumer -->|"Validação e promoção"| slots
+    consumer -->|"Registro transacional"| audit
+    monitor["Monitor<br/>localhost:8082"] -.->|"SELECT"| audit
+    monitor -.->|"Metadados e lag"| kafka
+    kafbat["Kafbat<br/>localhost:8080"] -.->|"Inspeção"| kafka
+    adminer["Adminer<br/>localhost:8081"] -.->|"Consultas SQL"| view
+    adminer -.->|"Consultas SQL"| audit
 ```
 
-O nome do projeto Compose continua `kafka-restore-lab` **intencionalmente**, para evitar que a mudança de versão crie volumes novos e esconda os dados da V7. NÃO execute `docker compose down -v` para atualizar. Execute em ambiente isolado quando estiver testando a V7 e a V8 simultaneamente, usando outro `--project-name` (nesse caso os volumes serão separados).
+As setas contínuas mostram o fluxo de dados; as pontilhadas indicam consultas das interfaces. PostgreSQL e SQL Server são cenários alternativos, cada um com seu destino de laboratório.
 
-### Atualizar volumes PostgreSQL existentes da V7, sem perda de dados
+1. `bootstrap` lê todos os contratos e publica a carga inicial no Kafka. Só pode ser usado em um destino ainda sem geração ativa.
+2. `incremental` examina uma faixa completa de IDs. Compara fingerprints SHA-256 e publica os dados dos registros novos ou alterados, além dos eventos `seen` com os IDs encontrados na origem.
+3. O consumer recebe `start`, `delta`, `seen` e `end`, confere contagens, hashes e compatibilidade do schema e identifica exclusões pela ausência de IDs na faixa validada. Um evento `abort` encerra um lote interrompido.
+4. Após validar o lote, o consumer alinha o slot inativo pelo journal, aplica as diferenças e troca a view pública dentro de uma transação. Um lote incompleto ou rejeitado não é promovido.
+5. A auditoria registra a execução, as mudanças e as faixas promovidas. O monitor apresenta essas evidências sem consultar diretamente a origem.
 
-O PostgreSQL executa os scripts de `docker-entrypoint-initdb.d` somente na criação do volume. **Obrigatório executar o upgrade antes de subir a V8 do consumer ou monitor em dados antigos.**
+No PostgreSQL, os fingerprints são calculados no banco e o extrator busca o conteúdo completo apenas dos registros divergentes. No SQL Server, o conteúdo de toda a faixa é lido pelo Python para gerar uma representação canônica. Nos dois casos, somente as diferenças seguem como payload de dados no Kafka; os eventos de presença também geram tráfego.
+
+### Uma execução incremental
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as Origem
+    participant E as Extrator
+    participant K as Kafka
+    participant C as Consumer
+    participant L as PostgreSQL local
+
+    E->>L: Conferir geração ativa, schema e ausência de lote pendente
+    E->>O: Abrir snapshot de leitura e examinar a faixa
+    O-->>E: IDs e fingerprints ou conteúdo para comparação
+    E->>L: Ler a mesma faixa do slot ativo e comparar
+    E->>K: start com faixa, schema e geração base
+    loop Registros novos ou alterados
+        E->>K: delta com os dados do registro
+    end
+    loop IDs presentes na origem dentro da faixa
+        E->>K: seen com o ID
+    end
+    E->>O: Encerrar a transação de leitura
+    E->>K: end com contagens e hashes
+    K-->>C: Entregar os eventos em ordem
+    C->>L: Gravar staging e validar o lote
+    alt Lote válido
+        C->>L: Aplicar diferenças e promover em uma transação
+        L-->>C: Commit dos dados, estado e checkpoint
+    else Lote rejeitado
+        C->>L: Registrar rejeição sem promover
+    end
+```
+
+O retorno da CLI confirma a publicação dos eventos. A conclusão da sincronização depende do processamento pelo consumer e deve ser conferida pelo estado `promoted`.
+
+### Promoção blue-green e rollback
+
+O exemplo parte de BLUE ativo e GREEN em espera. Na próxima promoção, os papéis se invertem.
+
+```mermaid
+flowchart TB
+    batch["Lote recebido por completo"] --> gate{"Hashes, contagens, schema,<br/>geração base e exclusões válidos?"}
+    gate -->|"Não"| reject["Rejeitar lote<br/>BLUE continua publicado"]
+    gate -->|"Sim"| align
+
+    subgraph promotion["Transação de promoção"]
+        align["Alinhar GREEN à geração ativa<br/>usando o journal"]
+        apply["Aplicar diferenças em GREEN<br/>e conferir os registros alterados"]
+        switch["Apontar public.contracts para GREEN<br/>Atualizar estado, auditoria e checkpoint"]
+        align --> apply --> switch
+    end
+
+    switch --> commit["Commit: GREEN publicado<br/>BLUE disponível para rollback"]
+    commit --> decision{"Rollback solicitado e<br/>schema compatível?"}
+    decision -->|"Sim"| rollback["Troca transacional para BLUE<br/>Registrar transição"]
+    decision -->|"Não"| keep["GREEN continua publicado"]
+```
+
+Uma falha durante a transação de promoção desfaz as alterações dessa transação. O rollback operacional seleciona a geração validada disponível no outro slot e não modifica a origem.
+
+## Componentes e serviços
+
+### Serviços do Docker Compose
+
+Serviços sem profile iniciam com `docker compose up -d --build`. Os demais são opcionais, ativados pelo profile ou pela seleção explícita do serviço. `cli`, `seed-fixture`, `mssql-cli` e `mssql-fixture` são ferramentas executadas com `run --rm`.
+
+| Serviço | Profile | Responsabilidade |
+|---|---|---|
+| `remote-db` | Padrão | PostgreSQL que simula a origem. Inicializa `lab_remote`, a tabela `public.contracts`, 10.000 contratos e a conta `remote_reader`. |
+| `remote-sqlserver` | `mssql` | Origem SQL Server opcional. O banco e os contratos são preparados pelo `mssql-fixture`. |
+| `local-db` | Padrão | PostgreSQL de destino. Mantém as tabelas blue-green, a view pública, staging, checkpoints, journal e auditoria no banco `lab_local`. |
+| `kafka` | Padrão | Broker e controller em modo KRaft. Transporta eventos de dados e auditoria em tópicos separados, com uma partição por tópico. |
+| `toxiproxy` | Padrão | Intermedeia a conexão com a origem e permite injetar latência, timeout, restrição de banda ou indisponibilidade. |
+| `consumer` | Padrão | Processo contínuo que consome Kafka, valida os lotes, aplica diferenças e promove o slot local. |
+| `cli` | `tools` | Interface de operação PostgreSQL: carga inicial, incremental, status, rollback, schema, catálogo e falhas de rede. |
+| `seed-fixture` | `tools` | Gera ou altera dados fictícios no PostgreSQL remoto. É o serviço com credencial administrativa dessa origem para `seed` e `mutate`. |
+| `scheduler` | `scheduled` | Executa incrementais PostgreSQL em sequência, com pausa de 60 segundos entre tentativas e faixas de 1.000 IDs. Exige bootstrap concluído. |
+| `mssql-cli` | `mssql-tools` | Interface de extração e catálogo SQL Server. Usa `remote_reader`, representação canônica e o mesmo pipeline Kafka/consumer. |
+| `mssql-fixture` | `mssql-tools` | Usa a conta administrativa do SQL Server fictício para criar banco, tabela, 100 contratos, conta de leitura e habilitar isolamento SNAPSHOT. Também oferece mutações de dados e DDL para testes. |
+| `mssql-scheduler` | `mssql-scheduled` | Executa incrementais SQL Server com pausa de 60 segundos e faixas de 1.000 IDs. Exige fixture e bootstrap concluídos. |
+| `monitor` | `monitor` | Painel HTTP de saúde da reconciliação. Consulta auditoria com `monitor_reader` e metadados Kafka; não aplica correções. |
+| `kafbat` | Padrão | Interface web para examinar brokers, tópicos, mensagens, grupos de consumidores e lag. |
+| `adminer` | Padrão | Interface web para acessar o banco local e consultar dados, estruturas e auditoria. |
+
+### Código e scripts
+
+| Arquivo | Função |
+|---|---|
+| `docker-compose.yml` | Define serviços, profiles, conexões, portas, volumes e parâmetros do laboratório. |
+| `app/Dockerfile` e `app/requirements.txt` | Constroem a imagem Python compartilhada e instalam os drivers PostgreSQL, Kafka e SQL Server. |
+| `app/lab.py` | Entrada da CLI, extrator PostgreSQL, protocolo Kafka, consumer, blue-green, rollback, scheduler e comandos de fixture. |
+| `app/mssql_sync.py` | Adaptador de extração SQL Server: leitura SNAPSHOT, comparação por faixa e publicação no Kafka. |
+| `app/canonical_contract.py` | Valida o contrato SQL Server e normaliza IDs, Unicode, valores nulos e decimais para comparação determinística. |
+| `app/schema_evolution.py` | Inspeção e controle do schema PostgreSQL, planejamento de DDL, preparação local, backfill e ativação. |
+| `app/source_catalog.py` | Captura e compara catálogos nativos e lógicos de PostgreSQL e SQL Server, mantendo histórico JSONB local. |
+| `app/sqlserver_fixture.py` | Inicialização e mutações administrativas restritas ao SQL Server fictício. |
+| `app/monitor.py` | Coleta sinais operacionais e fornece dashboard, detalhes de execuções e endpoints HTTP. |
+| `sql/remote.sql` | Inicialização da origem PostgreSQL fictícia e concessão de leitura ao extrator. |
+| `sql/local.sql` | Inicialização do destino, tabelas de controle, view pública e permissões do monitor. |
+| `sql/monitor_upgrade.sql` | Repara ou complementa estruturas de controle em um volume local já inicializado, com verificações de consistência. |
+| `tests/` | Verificações offline e scripts de integração com Docker. |
+
+## Requisitos
+
+- Docker Engine ou Docker Desktop com o plugin Docker Compose e daemon em execução.
+- Acesso à internet na primeira montagem para baixar imagens e dependências.
+- Bash para executar as funções e os scripts de teste dos exemplos.
+- Portas locais disponíveis conforme a tabela abaixo.
+- Para SQL Server: CPU compatível com a imagem e memória suficiente para executar esse banco junto dos demais serviços.
+- Python e as dependências de `tests/requirements.txt` para as verificações offline. A execução do laboratório usa o Python da imagem Docker.
+
+Execute os comandos na raiz deste repositório, onde está `docker-compose.yml`.
+
+| Acesso no host | Destino | Uso |
+|---|---|---|
+| `http://localhost:8080` | Kafbat | Inspeção do Kafka. |
+| `http://localhost:8081` | Adminer | SQL e auditoria. |
+| `http://localhost:8082` | Monitor | Saúde e progresso; exige o profile `monitor`. |
+| `localhost:55432` | PostgreSQL remoto | Banco `lab_remote`. |
+| `localhost:55433` | PostgreSQL local | Banco `lab_local`. |
+| `localhost:51433` | SQL Server remoto | Disponível no cenário SQL Server. |
+| `localhost:9092` | Kafka | Conexão de clientes executados no host. |
+| `http://localhost:8474` | API Toxiproxy | Controle dos proxies e das falhas simuladas. |
+
+As portas publicadas estão vinculadas a `127.0.0.1`. Dentro da rede Docker, os serviços usam seus nomes e portas internas; por exemplo, `local-db:5432` e `kafka:19092`.
+
+## Tutorial: PostgreSQL → Kafka → PostgreSQL
+
+### 1. Iniciar os serviços
 
 ```bash
-# No diretório V8, com o volume da V7 montado pelo mesmo nome de projeto:
-docker compose up -d local-db kafka
-# Seguro para repetir; NÃO faz DROP/TRUNCATE e não altera os dados dos contratos.
-docker compose exec -T local-db   psql -v ON_ERROR_STOP=1 -U postgres -d lab_local   < sql/monitor_upgrade.sql
+docker compose up -d --build
+docker compose --profile monitor up -d --build monitor
+docker compose ps
+docker compose run --rm cli chaos init
+```
 
-# Reconstrói consumer e interface sobre o volume existente.
+O PostgreSQL executa os scripts de inicialização somente na criação dos volumes. Em uma instalação nova, a origem recebe 10.000 contratos e o destino começa sem carga promovida. Se já existem volumes, consulte a seção de manutenção antes de continuar.
+
+### 2. Fazer a carga inicial
+
+```bash
+docker compose run --rm cli bootstrap
+docker compose run --rm cli status
+```
+
+A extração e o consumo são assíncronos. Aguarde a execução aparecer como `promoted` no monitor ou no `status` antes de iniciar outro lote. `extracting` e `loading` indicam trabalho ainda pendente.
+
+Confira o resultado no banco local:
+
+```bash
+docker compose exec -T local-db psql -U postgres -d lab_local -c \
+  'SELECT COUNT(*) FROM public.contracts;'
+```
+
+Em volumes novos e sem outras mutações, o resultado esperado é `10000`.
+
+### 3. Simular inclusão, alteração e exclusão
+
+Os comandos abaixo modificam exclusivamente a origem fictícia do laboratório. Execute o conjunto uma vez sobre os dados iniciais:
+
+```bash
+docker compose run --rm seed-fixture mutate update 1
+docker compose run --rm seed-fixture mutate hard-delete 2
+docker compose run --rm seed-fixture mutate insert 10001
+
+# Faixa de demonstração que inclui os três IDs alterados.
+docker compose run --rm cli incremental --from-id 1 --sweep-width 11000
+docker compose run --rm cli status
+```
+
+Após a promoção, são esperadas uma inclusão, uma atualização e uma exclusão. A contagem permanece em 10.000; o contrato `1` tem seu valor acrescido de `42`, o `2` desaparece e o `10001` passa a existir.
+
+```bash
+docker compose exec -T local-db psql -U postgres -d lab_local -c \
+  'SELECT id, amount FROM public.contracts WHERE id IN (1, 2, 10001) ORDER BY id;'
+```
+
+O tamanho da faixa conta posições de IDs, não linhas existentes. Uma alteração fora da faixa só aparece depois que uma execução examinar seu ID.
+
+### 4. Continuar a varredura
+
+```bash
+# Sem --from-id, retoma next_sweep_id; volta ao início ao superar o maior ID.
+docker compose run --rm cli incremental --sweep-width 1000
+
+# Aguarde esse lote aparecer como promoted antes de iniciar o scheduler.
+# Opcional: automatiza os próximos incrementais.
+docker compose --profile scheduled up -d --build scheduler
+docker compose logs -f scheduler consumer
+```
+
+O scheduler não faz bootstrap. A pausa de 60 segundos é somada ao tempo de cada tentativa. Para retomar os exercícios manuais, interrompa-o:
+
+```bash
+docker compose --profile scheduled stop scheduler
+```
+
+### 5. Testar rollback
+
+Depois de uma promoção incremental, com o scheduler parado e sem lote pendente:
+
+```bash
+docker compose run --rm cli rollback
+docker compose run --rm cli status
+```
+
+O rollback seleciona a geração validada disponível no outro slot. Ele exige schema compatível e não altera a origem. Para reaplicar o estado remoto do exemplo, execute novamente o incremental que cobre os IDs alterados e aguarde a promoção.
+
+## Tutorial: SQL Server → Kafka → PostgreSQL
+
+Este cenário usa um destino próprio: não faça um segundo bootstrap no destino já carregado pelo tutorial PostgreSQL. O exemplo abaixo usa outro nome de projeto para separar os volumes. Como as portas são as mesmas, pare o cenário PostgreSQL antes de iniciar o SQL Server.
+
+```bash
+docker compose --profile monitor --profile scheduled stop
+
+# Função Bash: mantenha este prefixo em todas as operações deste cenário.
+mssql_lab() {
+  docker compose -p kafka-restore-sqlserver \
+    --profile mssql --profile mssql-tools --profile monitor "$@"
+}
+
+mssql_lab up -d --build \
+  remote-sqlserver remote-db local-db kafka toxiproxy consumer kafbat adminer monitor
+
+# Apenas a fixture usa a conta administrativa do SQL Server fictício.
+mssql_lab run --rm mssql-fixture init
+mssql_lab run --rm mssql-cli chaos init --target sqlserver
+mssql_lab run --rm mssql-cli bootstrap
+mssql_lab run --rm mssql-cli status
+```
+
+Aguarde `promoted` antes da próxima etapa. A fixture cria 100 contratos em `dbo.contracts`, habilita `ALLOW_SNAPSHOT_ISOLATION` e prepara `remote_reader` com leitura. O serviço `remote-db` também sobe porque é dependência do Toxiproxy no Compose; a extração deste cenário usa o SQL Server.
+
+```bash
+mssql_lab run --rm mssql-fixture mutate-insert
+mssql_lab run --rm mssql-fixture mutate-update
+mssql_lab run --rm mssql-fixture mutate-delete
+mssql_lab run --rm mssql-cli incremental --from-id 1 --sweep-width 200
+mssql_lab run --rm mssql-cli status
+```
+
+Após a promoção, o destino permanece com 100 contratos: o ID `1` foi atualizado, o `2` foi removido e o `101` foi incluído. As interfaces usam os mesmos endereços da tabela de acessos.
+
+Para automatizar após o bootstrap:
+
+```bash
+mssql_lab --profile mssql-scheduled up -d --build mssql-scheduler
+mssql_lab logs -f mssql-scheduler consumer
+# Pare antes de executar incrementais ou experimentos manuais.
+mssql_lab --profile mssql-scheduled stop mssql-scheduler
+```
+
+O leitor exige isolamento transacional `SNAPSHOT`; se estiver desabilitado, a extração é recusada. `READ COMMITTED` e `NOLOCK` não substituem essa exigência. O adaptador suporta o contrato de cinco colunas (`id`, `contract_code`, `amount`, `status`, `description`), PK `BIGINT` positiva, texto Unicode e valor monetário decimal com duas casas. O limite padrão de faixa é 100.000 IDs, definido por `MAX_SQLSERVER_SWEEP_WIDTH`.
+
+## Monitoramento e auditoria
+
+Abra `http://localhost:8082`. O painel atualiza a cada 15 segundos e reúne:
+
+| Sinal | Evidência e interpretação |
+|---|---|
+| Origem | Última extração, motor e falhas registradas em `replica.sync_runs`; a disponibilidade atual da origem não é sondada. |
+| Extração | Lotes pendentes, rejeitados, com falha ou sem conclusão dentro do tempo esperado. |
+| Kafka e consumer | Acesso ao broker, tópicos de dados e auditoria, membros do grupo, offsets e lag. |
+| Destino e blue-green | Acessibilidade do PostgreSQL local, slot ativo, gerações e histórico de promoção/rollback. |
+| Integridade e exclusões | Contadores de inserção, atualização e exclusão dos lotes promovidos. |
+| DDL | Hash ativo, migração pendente, progresso do backfill e observações do catálogo por origem. |
+| Cobertura | União dos intervalos numéricos promovidos na janela configurada e na linhagem atual. |
+
+| Endpoint | Finalidade |
+|---|---|
+| `/` | Dashboard HTML. |
+| `/run/<UUID>` | Detalhes de uma execução. |
+| `/status.json` | Estado consolidado em JSON. |
+| `/healthz` | Liveness: confirma que o processo HTTP do monitor responde. |
+| `/readyz` | Prontidão das dependências: HTTP 200 se Kafka e PostgreSQL local estiverem acessíveis; 503 em caso de falha. |
+
+```bash
+curl -fsS http://localhost:8082/status.json
+curl -i http://localhost:8082/healthz
+curl -i http://localhost:8082/readyz
+```
+
+No Adminer, selecione PostgreSQL, servidor `local-db`, banco `lab_local`, usuário `postgres` e senha `lab-admin`. Para verificar a auditoria:
+
+```sql
+SELECT run_id, mode, status, inserted_count, updated_count, deleted_count, error
+FROM replica.sync_runs
+ORDER BY started_at DESC LIMIT 15;
+
+SELECT * FROM replica.active_state;
+SELECT * FROM replica.slot_state;
+SELECT * FROM replica.transitions ORDER BY id DESC LIMIT 15;
+
+SELECT run_id, sweep_low, sweep_high, target_max_id, source_engine, checked_at
+FROM replica.range_checkpoints
+ORDER BY checked_at DESC LIMIT 15;
+```
+
+As tabelas `replica.blue_contracts` e `replica.green_contracts` guardam os dados físicos. `replica.generations` registra a linhagem; `replica.change_journal`, as imagens anteriores e posteriores usadas para alinhar slots; `replica.ingest_delta`, `replica.ingest_keys` e `replica.ingest_deep`, o staging de ingestão. Consulte `public.contracts` para ler os dados publicados.
+
+### Ajustar os alertas
+
+Edite o ambiente de `monitor` em `docker-compose.yml` e recrie o serviço com `docker compose --profile monitor up -d monitor`.
+
+| Variável | Padrão | Efeito |
+|---|---|---|
+| `LAB_STALLED_MINUTES` | `15` | Tempo para considerar um lote sem conclusão como travado. |
+| `LAB_COVERAGE_WINDOW_HOURS` | `24` | Janela móvel usada para calcular cobertura. |
+| `LAB_MAX_COVERAGE_INTERVALS` | `20000` | Limite de intervalos consultados pelo painel. |
+| `LAB_MAX_CONSUMER_LAG` | `1000` | Limite de mensagens atrasadas para alertar. |
+| `LAB_EXPECTED_INTERVAL_MINUTES` | `0` | Desabilita expectativa de promoção periódica. Configure um limite apenas se houver agendamento ativo. |
+| `LAB_CONSUMER_GROUP` | Definido no Compose | Grupo Kafka observado; deve corresponder ao grupo usado pelo consumer. |
+
+`unknown` significa ausência de evidência. Lag zero não comprova igualdade com a origem; uma promoção recente não comprova cobertura completa. `operational` indica que os sinais observados não geraram alertas. O monitor não consulta os dados completos da tabela ativa a cada atualização e não envia alertas externos.
+
+A cobertura mede o espaço numérico entre `1` e o maior ID registrado. IDs esparsos podem produzir um percentual diferente da proporção de linhas conferidas. Checkpoints são gravados na mesma transação da promoção; lotes rejeitados e gerações fora da linhagem após rollback não somam cobertura. Sem limite superior conhecido, a cobertura permanece não aferida. Scans em momentos diferentes não constituem um snapshot global.
+
+## Mudanças de estrutura e catálogo
+
+```mermaid
+flowchart TB
+    change["Mudança de schema observada"] --> engine{"Origem?"}
+    engine -->|"PostgreSQL"| plan["schema plan<br/>Inspecionar e classificar a mudança"]
+    plan --> eligible{"Uma coluna TEXT nullable<br/>adicionada ao final, sem default?"}
+    eligible -->|"Não"| review["Revisão manual<br/>Sincronização bloqueada por divergência"]
+    eligible -->|"Sim"| approve["schema apply<br/>Aprovação explícita do operador"]
+    approve --> prepare["Preparar os dois slots locais<br/>Bloquear sincronização normal e rollback"]
+    prepare --> backfill["schema backfill<br/>Enviar uma faixa pelo Kafka"]
+    backfill --> wait["Consumer valida e aplica o lote"]
+    wait --> complete{"Todas as faixas concluídas?"}
+    complete -->|"Não"| backfill
+    complete -->|"Sim"| activate["schema activate<br/>Revalidar schema e limite de IDs"]
+    activate --> valid{"Validação aprovada?"}
+    valid -->|"Não"| pending["Manter migração pendente<br/>Investigar a divergência"]
+    valid -->|"Sim"| resume["Ampliar a view pública<br/>Liberar sincronização normal"]
+    engine -->|"SQL Server"| observe["Registrar catálogo e diferenças<br/>em JSONB local"]
+    observe --> block["Bloquear nova extração de dados<br/>Exigir revisão sem DDL automático"]
+```
+
+### PostgreSQL: planejar, preparar, preencher e ativar
+
+Execute este exercício com o scheduler parado, após um bootstrap PostgreSQL e sem lote pendente. O primeiro comando altera administrativamente apenas a origem fictícia:
+
+```bash
+docker compose exec -T remote-db psql -v ON_ERROR_STOP=1 -U postgres -d lab_remote -c \
+  'ALTER TABLE public.contracts ADD COLUMN currency_code TEXT;'
+
+docker compose run --rm cli schema plan
+docker compose run --rm cli schema apply
+docker compose run --rm cli schema backfill --sweep-width 1000
+docker compose run --rm cli schema status
+```
+
+`schema plan` inspeciona a mudança. `schema apply` representa a aprovação explícita do operador e prepara os dois slots locais. A única mudança elegível é adicionar uma coluna `TEXT` nullable no final da tabela, sem default.
+
+Repita `schema backfill` e consulte `schema status`, aguardando o consumer concluir cada lote, até todas as faixas estarem validadas. O backfill transporta os valores da nova coluna via Kafka. Durante a migração, a sincronização normal e o rollback ficam bloqueados; a view pública mantém o contrato anterior.
+
+```bash
+# Somente após a conclusão de todas as faixas:
+docker compose run --rm cli schema activate
+docker compose run --rm cli incremental --from-id 1 --sweep-width 1000
+```
+
+A ativação confere novamente o schema e o limite de IDs antes de ampliar a view. Renomear ou remover colunas, mudar tipos, nulabilidade, PK, constraints ou índices exige revisão manual.
+
+### SQL Server: observar e bloquear mudanças inesperadas
+
+Usando a função `mssql_lab` do tutorial:
+
+```bash
+mssql_lab run --rm mssql-cli catalog observe --engine sqlserver --source-key mssql-dbo-contracts
+mssql_lab run --rm mssql-fixture add-column
+mssql_lab run --rm mssql-cli catalog observe --engine sqlserver --source-key mssql-dbo-contracts
+mssql_lab run --rm mssql-cli catalog history --source-key mssql-dbo-contracts
+```
+
+Depois do `add-column`, uma nova extração de dados deve ser bloqueada por divergência de schema. Não há migração automática de DDL SQL Server para PostgreSQL. A geração publicada permanece disponível.
+
+`replica.source_catalog_observations` preserva `native_manifest`, `logical_manifest`, hashes e diferenças. O catálogo nativo inclui detalhes como tamanho, precisão, collation, índices e constraints conforme a visibilidade da conta. O lógico organiza as colunas por nome para comparação. As observações representam o estado encontrado, não todos os comandos DDL executados entre leituras.
+
+O controle de evolução PostgreSQL usa `replica.schema_versions`, `replica.schema_state` e `replica.schema_changes`. As tabelas `replica.schema_backfill_runs`, `replica.schema_backfill_values` e `replica.schema_backfill_intervals` registram lotes, valores em staging e faixas concluídas.
+
+## Simular falhas e recuperar o processamento
+
+Com o scheduler parado, teste a conexão PostgreSQL:
+
+```bash
+docker compose run --rm cli chaos latency 300
+docker compose run --rm cli incremental --from-id 1 --sweep-width 1000
+# Aguarde a conclusão antes do próximo lote.
+docker compose run --rm cli chaos clear
+
+docker compose run --rm cli chaos down
+# Deve falhar sem promover outro slot.
+docker compose run --rm cli incremental --from-id 1 --sweep-width 1000
+docker compose run --rm cli chaos up
+```
+
+No SQL Server, use `mssql_lab run --rm mssql-cli chaos ... --target sqlserver`. `chaos status` mostra o proxy; `chaos clear` remove as falhas injetadas e reabilita a conexão. A CLI também oferece `timeout` e `bandwidth`.
+
+Para observar o consumo assíncrono, pare `consumer`, execute um incremental, confira que a geração ativa ainda não mudou e volte a iniciar o serviço. O consumer retoma o consumo pelos offsets confirmados. Aguarde a promoção antes de publicar outro lote.
+
+| Situação | Diagnóstico e ação |
+|---|---|
+| `Previous batch pending` | Consulte `status`, logs e mensagens no Kafbat. Resolva o lote anterior antes de iniciar outro. |
+| Lote `extracting` ou `loading` por muito tempo | Verifique consumer, Kafka, evento `end` e erros do extrator. A duração sozinha não autoriza descartar o lote. |
+| Lote `rejected` | Leia `error` em `replica.sync_runs`. Pode haver divergência de hash, geração base ou limite de exclusão. |
+| Exclusões bloqueadas | `MAX_REMOVE_FRACTION`, configurado no **consumer**, limita a fração removida na faixa e no total local; padrão `0.20`. Investigue a origem antes de ajustar. |
+| Schema divergente | Consulte `schema plan` no PostgreSQL ou o histórico de catálogo SQL Server; siga o procedimento de revisão. |
+| Monitor com erro de tabela/permissão | Confira inicialização do banco e aplique o reparo de estruturas locais quando necessário. |
+| Origem indisponível | Confira logs, estado do proxy e credenciais. Use `chaos clear` para encerrar a simulação. |
+
+```bash
+docker compose logs --tail 100 consumer local-db kafka toxiproxy
+docker compose --profile monitor logs --tail 100 monitor
+```
+
+Para um lote realmente abandonado, a CLI oferece `abandon --run-id <UUID> --force` e `schema abandon --run-id <UUID> --force` para backfill. Antes de usar, confirme que não há produtor ativo nem evento `end` já publicado ou em fila. Esses comandos publicam um aborto ordenado; não desfazem uma promoção que já ocorreu.
+
+## Configuração, persistência e manutenção
+
+As conexões e opções estão no ambiente dos serviços em `docker-compose.yml`:
+
+| Variável | Finalidade |
+|---|---|
+| `REMOTE_DSN` | Conexão PostgreSQL de leitura via Toxiproxy. |
+| `REMOTE_DIRECT_DSN` | Conexão direta de leitura usada pelo gerador de carga PostgreSQL. |
+| `LOCAL_DSN` | Conexão ao destino; o monitor usa a conta restrita `monitor_reader`. |
+| `KAFKA_BOOTSTRAP` | Endereço interno do broker. |
+| `KAFKA_TOPIC` e `KAFKA_AUDIT_TOPIC` | Tópicos de dados e auditoria. Preserve a configuração de todos os participantes ao reutilizar volumes. |
+| `TOXIPROXY_URL` | API de controle das falhas simuladas. |
+| `REMOTE_ENGINE` | Seleciona o extrator PostgreSQL ou SQL Server. |
+| `MSSQL_HOST`, `MSSQL_PORT`, `MSSQL_DATABASE`, `MSSQL_USER`, `MSSQL_PASSWORD` | Conexão SQL Server de leitura. |
+| `MSSQL_SCHEMA` e `MSSQL_TABLE` | Objeto SQL Server inspecionado; padrões `dbo` e `contracts`. O contrato de dados continua restrito às cinco colunas suportadas. |
+| `REMOTE_ADMIN_DSN` e `MSSQL_SA_PASSWORD` | Credenciais administrativas das fixtures. Não devem ser fornecidas aos extratores. |
+
+As senhas do Compose são de laboratório: `lab-admin` para o administrador PostgreSQL, `lab-reader` para leitores da origem e `monitor-reader` para o monitor. Kafbat, Adminer e monitor não possuem uma camada de autenticação de produção neste projeto.
+
+Os volumes `remote_data`, `local_data`, `kafka_data` e `mssql_data` persistem os bancos e o Kafka. O projeto Compose padrão se chama `kafka-restore-lab`; o tutorial SQL Server usa `kafka-restore-sqlserver`. Mudar o nome do projeto cria outro conjunto de volumes. Use o mesmo prefixo de projeto em todas as operações do cenário.
+
+### Reutilizar ou reparar um volume local
+
+Scripts em `docker-entrypoint-initdb.d` não são executados novamente em volumes inicializados. Para um volume que já tenha as tabelas base blue-green, pare produtores, consumer e monitor antes de aplicar o script local. Exemplo para o cenário PostgreSQL:
+
+```bash
+docker compose --profile scheduled --profile monitor stop scheduler consumer monitor
+docker compose up -d local-db kafka
+
+docker compose exec -T local-db psql -X -v ON_ERROR_STOP=1 -U postgres -d lab_local \
+  < sql/monitor_upgrade.sql
+
 docker compose up -d --build consumer
 docker compose --profile monitor up -d --build monitor
 ```
 
-Se V7 ainda estiver executando, substitua os containers pelo Compose V8 no mesmo projeto; **não rode duas versões do consumer no mesmo group id** ao mesmo tempo. O upgrade acrescenta duas colunas na auditoria, `replica.range_checkpoints`, permissões SELECT e índices. Não reconstrói blue/green e não toca no remoto. Checkpoints só existem para faixas **promovidas após essa atualização**; execuções passadas não são inventadas para compor a cobertura.
+O script é transacional, pode ser repetido e não apaga os contratos. Ele complementa estruturas de schema, catálogo, auditoria e cobertura, corrige a restrição de estado de schema conhecida e concede as leituras do monitor. Recusa o reparo se faltarem as tabelas base ou se não conseguir estabelecer um estado consistente para gerações existentes. Revise qualquer erro antes de reiniciar os processos; não tente corrigir apagando volumes com dados necessários.
 
-## O que é consolidado na GUI
+Para o cenário SQL Server, use o prefixo `mssql_lab` e pare também `mssql-scheduler`. Checkpoints não são criados retroativamente para execuções passadas. Retome o scheduler somente depois de verificar o estado local.
 
-| Etapa | Sinal | Fonte de evidência | Limitação |
-|---|---|---|---|
-| Origem | Última extração, falhas e motor PostgreSQL/SQL Server | `replica.sync_runs` | Disponibilidade atual não é sondada |
-| Extração/reconciliação | Lotes pendentes, travados e rejeitados, tamanho do intervalo | `sync_runs` e checkpoints | Faixas independentes não são snapshot global |
-| Kafka | Broker, tópico de dados e auditoria, consumer group/lag | Metadados de Kafka (somente leitura) | Lag não equivale a alterações pendentes |
-| Consumer | Membros, estado de grupo, offsets confirmados | API administrativa Kafka | Não garante integridade sozinho |
-| PostgreSQL local | Acessibilidade + contadores de auditoria | PostgreSQL, role `monitor_reader` | Não consulta os 700 GB da tabela ativa a cada atualização |
-| Blue-green | Slot ativo, versões BLUE/GREEN, transição/rollback | `active_state`, `slot_state`, `transitions` | Mesma instância, não HA física |
-| Integridade/deletes | INSERT/UPDATE/DELETE promovidos, lote bloqueado | `sync_runs`, somente promovidos | Deletes inferidos por ausência na faixa validada |
-| DDL | Hash ativo, hash pendente, backfill e dicionários por origem | `schema_state`, `source_catalog_observations` | Detecção do estado atual, não trilha literal de todos ALTER TABLE |
-| Cobertura | União dos intervalos numéricos de PK promovidos nas últimas 24h e na linhagem atual | `range_checkpoints` | Não é percentual de linhas, bytes ou garantia de simultaneidade |
-
-A visão ponta a ponta inclui alertas com orientação de diagnóstico, links para Kafbat/Adminer, lista de execuções, página de detalhes `/run/<UUID>`, `/status.json`, `/healthz` (liveness do painel) e `/readyz` (Kafka + PostgreSQL local acessíveis). Tudo por polling HTTP, sem frontend separado e sem stack de telemetria adicional.
-
-**Cobertura de IDs:** o producer registra `sweep_target_max_id` no `start` Kafka. O consumer só grava a faixa em `range_checkpoints` **dentro da mesma transação de promoção blue-green**. Lotes rejeitados/abortados e gerações descartadas por rollback não somam cobertura. Faixas sem limite superior registrado são "não aferidas", nunca 100%. A janela configurável padrão é de 24 h. A união representa o espaço de chaves inteiras entre 1 e o maior ID observado, portanto, bases de IDs esparsos podem mostrar uma porcentagem que não corresponde à proporção de registros conferidos.
-
-**Não prometemos consistência global:** uma sequência de scans de faixas em transações diferentes não comprova a igualdade simultânea de todo o banco. Sem `updated_at`, `deleted_at`, CDC ou log autorizado, alterações que ocorreram depois da leitura de uma faixa dependem de outro ciclo completo para aparecer.
-
-## Configurar expectativas e alertas
-
-Valores do serviço `monitor` em `docker-compose.yml`:
-
-```yaml
-LAB_STALLED_MINUTES: "15"              # bloqueio de lote por tempo
-LAB_COVERAGE_WINDOW_HOURS: "24"        # janela móvel da cobertura
-LAB_MAX_COVERAGE_INTERVALS: "20000"    # limite de query do painel
-LAB_MAX_CONSUMER_LAG: "1000"            # limite de mensagens em atraso
-LAB_EXPECTED_INTERVAL_MINUTES: "0"     # zero = cronograma NÃO definido
-```
-
-**Não habilite um SLA de frescor sem existir agendamento.** O valor `0` é intencional para o laboratório iniciado manualmente. Se houver scheduler confiável, configure o intervalo máximo aceitável, por exemplo `15`; a interface alertará se o tempo desde a última promoção ultrapassar esse valor. Isso não é uma estimativa de RPO do conjunto remoto.
-
-O painel atribui `unknown` quando não há métrica real. Um Kafka acessível sem consumer group/offset confirmado não vira lag zero; origem indisponível mas sem execução recente continua como "não sondada". `overall=operational` significa somente que **os sinais observados não produziram alertas**, não que os dados remotos e locais estejam integralmente iguais. Se o monitor ficar indisponível, o `/healthz` deixa de responder; `/readyz` retorna HTTP 503 caso Kafka ou PostgreSQL local falhem.
-
-## Consultas rápidas
+### Parar e retomar
 
 ```bash
-curl -s http://localhost:8082/status.json
-curl -si http://localhost:8082/healthz
-curl -si http://localhost:8082/readyz
+# Cenário PostgreSQL: preserva os volumes.
+docker compose --profile monitor --profile scheduled stop
 
-# Ver evidências de faixas efetivamente promovidas (não de extrações incompletas)
-docker compose exec -T local-db psql -U postgres -d lab_local -c   'SELECT run_id,sweep_low,sweep_high,target_max_id,source_engine,version,checked_at FROM replica.range_checkpoints ORDER BY checked_at DESC LIMIT 15;'
+# Retoma a infraestrutura e o monitor; não repete o bootstrap.
+docker compose up -d
+docker compose --profile monitor up -d monitor
+```
 
-# Testes offline (sem Docker)
-python tests/check_static.py
-python tests/test_monitor.py
+Para o cenário SQL Server, pare com `mssql_lab --profile mssql-scheduled stop` e retome os serviços usando o mesmo comando `mssql_lab up` do tutorial, sem executar fixture ou bootstrap novamente. `docker compose down` remove containers e rede, preservando os volumes nomeados; `docker compose down -v` também apaga os dados persistidos.
 
-# Smoke opcional: depende de ambiente Docker previamente inicializado
+## Verificações e testes
+
+As verificações abaixo não precisam de Docker, Kafka ou bancos ativos. Instale `tests/requirements.txt` no seu ambiente Python e execute:
+
+```bash
+python3 tests/check_static.py
+python3 tests/test_reconcile.py
+python3 tests/test_generation_paths.py
+python3 tests/test_schema_contract.py
+python3 tests/test_source_catalog.py
+python3 tests/test_mssql_contract.py
+python3 tests/test_mssql_paths.py
+python3 tests/test_monitor.py
+```
+
+Os testes cobrem contratos, hashes, caminhos de geração/rollback, evolução de schema, catálogo e regras do monitor com simulações. Não substituem os testes com bancos reais.
+
+Com o cenário PostgreSQL inicializado e o monitor ativo, há um smoke test de leitura:
+
+```bash
 LAB_MONITOR_SMOKE=1 bash tests/e2e_monitor.sh
 ```
 
-## O que conscientemente NÃO foi implementado
-
-- Grafana/Prometheus/Loki/Tempo/Uptime Kuma, exporters, tracing, novo banco de métricas.
-- Probes ativos da origem, para não acrescentar carga nem credenciais remotas ao monitor. Esse indicador permanece `unknown` quando faltam evidências.
-- Alarmes push por e-mail/Slack, controle de correções, replay pelo navegador, ou qualquer permissão de escrita.
-- Percentual de consistência dos 700 GB, RPO global derivado de última promoção ou latência artificial entre banco remoto e local.
-
----
-
-## Histórico e documentação preservada da V7
-
-# Kafka Restore Lab V7 — Observabilidade mínima sem Grafana
-
-**Decisão:** a V6 já dispõe de Kafbat UI (tópicos, brokers, consumidores e lag), Adminer (SQL e auditoria), logs JSON do Docker e Toxiproxy (testes de resiliência). **Não foram adicionados** Grafana, Prometheus, Loki, Uptime Kuma, exporters, séries temporais nem banco de dados novo.
-
-A única lacuna operacional era **conferir em uma GUI, sem executar consultas manualmente, se o fluxo de reconciliação está progredindo e se uma geração foi promovida com sucesso**. Esta V7 acrescenta um painel HTTP **opcional, somente de leitura**. O pipeline de sincronização, consumidores, reconciliação DDL e blue-green da V6 não foi modificado.
-
-## GUI disponíveis
-
-| Endereço (host local) | Função | Situação |
-|---|---|---|
-| http://localhost:8080 | Kafbat UI: tópicos, mensagens, consumer groups, offset lag | Já existia |
-| http://localhost:8081 | Adminer: banco local, SQL de auditoria, histórico DDL | Já existia |
-| http://localhost:8082 | **Monitor V7**: última promoção, versão/slot, falhas, lotes pendentes, DDL pendente e broker | **Novo, opt-in** |
-
-A GUI V7 consulta `replica.active_state`, `replica.transitions`, `replica.sync_runs` e `replica.schema_state` com **`monitor_reader` (somente SELECT)**; verifica o tópico de dados Kafka. **Nunca** consulta o remoto, executa reparos, aplica DDL, altera offsets ou acessa o Docker socket. Sem credenciais de administração do PostgreSQL no painel.
-
-## Inicialização com bancos novos
+Os testes de integração seguintes **alteram dados e estruturas**. `e2e_schema.sh` e `e2e_sqlserver_sync.sh` também removem os volumes do projeto. Execute-os somente em um projeto descartável, com portas disponíveis; cada comando abaixo cria um cenário separado:
 
 ```bash
-cd kafka_restore_lab_v7
-docker compose up -d --build
-docker compose run --rm cli chaos init
-# Opcional: sobe apenas o monitor, sem novos stacks
-docker compose --profile monitor up -d --build monitor
-# GUI de status: http://localhost:8082
+COMPOSE_PROJECT_NAME=kafka-test-reconcile bash tests/e2e.sh
+COMPOSE_PROJECT_NAME=kafka-test-schema LAB_RESET=1 bash tests/e2e_schema.sh
+COMPOSE_PROJECT_NAME=kafka-test-catalog LAB_SQLSERVER_TEST=1 bash tests/e2e_sqlserver_catalog.sh
+COMPOSE_PROJECT_NAME=kafka-test-sqlserver LAB_RESET=1 bash tests/e2e_sqlserver_sync.sh
 ```
 
-### Migração da V6 para V7 sem perder dados
-
-Se **já possui volume V6** inicializado, o PostgreSQL NÃO reexecuta `sql/local.sql`. Aplique **uma única vez** a concessão mínima (idempotente):
-
-```bash
-# Use o diretório e banco local da V7 após migrar os volumes, ou adapte ao
-# projeto Compose existente que já mantém os volumes. NÃO use down -v.
-docker compose exec -T local-db psql -U postgres -d lab_local < sql/monitor_upgrade.sql
-docker compose --profile monitor up -d --build monitor
-```
-
-**Atenção:** como o Compose usa `name: kafka-restore-lab` neste pacote, o prefixo dos volumes muda em relação à V6. Isso cria bancos novos por padrão. Para manter os volumes existentes, ajuste o nome do projeto Compose para o nome usado na V6 (`kafka-restore-lab-v6`) **antes de iniciar a V7**, ou faça a migração de volumes explicitamente. Faça backup antes; não use `docker compose down -v`.
-
-Exemplo seguro para reusar o projeto e os volumes V6, com o arquivo V7:
-
-```bash
-# Dentro de kafka_restore_lab_v7, sem modificar o projeto V6
-docker compose -p kafka-restore-lab-v6 exec -T local-db \
-  psql -U postgres -d lab_local < sql/monitor_upgrade.sql
-docker compose -p kafka-restore-lab-v6 --profile monitor up -d --build monitor
-```
-
-A opção `-p` substitui o `name:` do Compose para apontar aos volumes do projeto V6. Confirme previamente que não há outra instância usando esse nome.
-
-## Endpoints do monitor
-
-- `/` — dashboard HTML que atualiza a cada 15 segundos.
-- `/status.json` — o mesmo estado em JSON, útil para testes manuais.
-- `/healthz` — prontidão do próprio painel e conectividade com o PostgreSQL local; **não** é certificação de consistência de dados.
-
-O monitor reporta `operational`, `attention`, `not_initialized` e `unavailable`. `attention` é acionado por lotes travados por mais de `LAB_STALLED_MINUTES=15`, migração DDL pendente ou falha/rejeição nas últimas 24 horas. Não emite alertas externos. A GUI continua aberta mesmo que o Kafka esteja indisponível, desde que o PostgreSQL local responda.
-
-## O que o monitor NÃO comprova
-
-- **Broker online ≠ consumer em dia.** Verifique *consumer lag* e membros do grupo `lab-range-bluegreen-v4` no Kafbat UI.
-- **Promoção recente ≠ cobertura da origem inteira.** Com varredura por faixas sem CDC e sem `updated_at`, alterações só aparecem após a respectiva faixa ser examinada. O painel exibe `next_sweep_id`, mas a V6 ainda não mantém um indicador formal de cobertura completa/ciclo concluído.
-- **Banco local acessível ≠ origem acessível.** O monitor evita consultas à fonte remota para não amplificar degradações. Erros de origem aparecem pelo histórico de execução.
-- Não há monitoramento de CPU/memória por serviço, alertas automáticos de SLA nem histórico temporal de métricas. Se o laboratório evoluir para execução contínua com SLO/RPO formal, avaliar Prometheus+Grafana+Alertmanager, sem instalar preventivamente.
-
-## Segurança e limites
-
-- A UI não tem autenticação: **exposta somente em `127.0.0.1:8082` no Docker Compose**. Não publique esta porta em redes corporativas. Para produção, seria necessária autenticação/TLS e secrets reais.
-- Senha `monitor-reader` é **somente de fixture** e deve ser trocada fora do laboratório.
-- Não exponha Kafbat/Adminer publicamente; eles continuam vinculados a `127.0.0.1`.
-- As leituras do monitor são leves e limitadas às últimas 12 execuções (as contagens agregadas usam índices/tabelas locais).
-
-## Validar
-
-```bash
-python -m py_compile app/monitor.py
-python tests/test_monitor.py
-python tests/check_static.py
-# Teste integrado com Docker (requer daemon):
-curl -fsS http://localhost:8082/status.json
-curl -fsS http://localhost:8082/healthz
-```
-
-**Validação neste ambiente:** estática e testes unitários; não foi possível executar Compose e testar integração em banco e Kafka reais.
-
----
-
-## Documentação da V6 (preservada)
-
-# Kafka Restore Lab V6 — SQL Server ou PostgreSQL → Kafka → PostgreSQL
-
-**Implementação experimental: SQL Server passou a ser origem de DADOS, e não somente origem de catálogo DDL.** A V6 preserva o reconciliador PostgreSQL da V5 e acrescenta um extrator SQL Server com conta de leitura, comparação canônica Python, Kafka e blue-green PostgreSQL. O ambiente é **laboratório descartável, não homologado para banco de 700 GB/produção**.
-
-## 1. Novidades V6
-
-| Função | PostgreSQL remoto | SQL Server remoto |
-|---|---|---|
-| Metadados estruturais | `pg_catalog` | `sys.*` (histórico JSONB) |
-| Bootstrap inicial | Sim | **Sim** |
-| Varredura por chave `BIGINT` sem `updated_at` | Sim | **Sim** |
-| Detecção de INSERT / UPDATE | SHA-256 PG | **Canonical SHA-256 em Python** |
-| Hard DELETE | Ausência em faixa COMPLETA | **Ausência em faixa COMPLETA** |
-| Kafka de dados | `lab.sync.events.v6` | Mesmo tópico |
-| Blue-green/rollback | Duas tabelas e journal | Mesmo consumidor |
-| DDL inesperado | Gate V5, migração PG aditiva | **Fail closed, observação em JSONB; sem migração automática** |
-| Tolerância a falhas | Toxiproxy PostgreSQL | **Toxiproxy SQL Server** |
-
-**Limite irredutível:** sem timestamp, CDC ou tracking de mudanças, o produtor SQL Server precisa **ler o conteúdo de cada faixa** para saber o que mudou. Somente os registros divergentes seguem como payload Kafka; eventos leves de presença (`seen`) são emitidos para detectar deletes. Isso reduz o tráfego Kafka, **não** o custo de leitura/rede entre SQL Server e extrator. A convergência depende de cobrir todas as faixas.
-
-## 2. Subir o experimento SQL Server → Kafka → PostgreSQL
-
-Requisitos: Docker Compose, CPU compatível com SQL Server 2022, memória disponível (SQL Server requer vários GiB). A V6 usa os dados falsos criados no contêiner; **nunca aponte os comandos de fixture para uma instância real**.
-
-```bash
-cd kafka_restore_lab_v6
-
-# SQL Server, PostgreSQL local, Kafka, consumer, rede simulada e UI.
-docker compose --profile mssql --profile mssql-tools up -d --build \
-  remote-sqlserver remote-db local-db kafka toxiproxy consumer kafbat adminer
-
-# Fixture descartável: cria SQL Server lab_remote, 100 contratos e conta SELECT.
-# Somente este processo usa sa. Inclui ALLOW_SNAPSHOT_ISOLATION ON.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture init
-
-# Faz a carga inicial, uma única vez.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli bootstrap
-
-# Verifica promoções após o consumer terminar de processar.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli status
-```
-
-Gere alterações sintéticas:
-
-```bash
-# Os três comandos abaixo usam SA exclusivamente no contêiner de fixture.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture mutate-insert
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture mutate-update
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture mutate-delete
-
-# Agora apenas compara IDs 1 a 200, publica diferenças e presença de IDs.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  incremental --from-id 1 --sweep-width 200
-
-# Status: inseridos, atualizados, removidos, erro, geração ativa.
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli status
-```
-
-Kafbat UI `http://localhost:8080`; Adminer `http://localhost:8081` (`local-db`, db `lab_local`, user `postgres`, password `lab-admin`). Compare `public.contracts` com `replica.blue_contracts`, `replica.green_contracts`, `replica.sync_runs`, `replica.transitions` e `replica.source_catalog_observations`.
-
-A promoção é feita pelo consumer em outra execução: `status` pode mostrar o lote `loading` até o evento `end` ser validado. A versão pública não muda antes disso.
-
-## 3. Testar rede degradada e DDL
-
-```bash
-# Inicializar proxy SQL Server (pode ser chamado mais de uma vez):
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli chaos init --target sqlserver
-
-# Injetar 300ms de latência:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli chaos latency 300 --target sqlserver
-
-# Restaurar conectividade normal:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli chaos clear --target sqlserver
-
-# Derrubar conexão remota (próximo incremental não deve promover):
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli chaos down --target sqlserver
-
-# Reparar:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli chaos up --target sqlserver
-```
-
-A documentação/alterações de DDL podem ser vistas no banco local. Teste com fixture:
-
-```bash
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture add-column
-# Observa a nova versão, registrando seu hash e diff, sem migrar o destino:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  catalog observe --engine sqlserver --source-key mssql-dbo-contracts
-# Nova leitura deve BLOQUEAR por schema drift; versão local permanece disponível:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli incremental \
-  --from-id 1 --sweep-width 200
-```
-
-## 4. Garantias, pré-requisitos e limitações
-
-1. **Transação SNAPSHOT obrigatória.** O leitor consulta `sys.databases.snapshot_isolation_state` e recusa iniciar se a opção `ALLOW_SNAPSHOT_ISOLATION` estiver desabilitada. O SQL Server do lab a habilita via SA **somente no bootstrap da fixture**. Uma origem corporativa real precisaria já oferecê-la, ou exigiria negociação com o DBA. `READ COMMITTED`, mesmo com RCSI, não substitui uma visão transacional consistente entre múltiplas consultas. Não usamos `NOLOCK`.
-2. **Acesso remoto mínimo.** O produtor usa `remote_reader` com `GRANT SELECT` e visibilidade dos metadados. A aplicação jamais envia `ALTER TABLE`, `CREATE`, trigger, CDC ou qualquer DDL para a origem. O usuário `sa` existe apenas no fixture de teste separado.
-3. **Contrato de dados estrito.** A V6 replica **uma tabela** `dbo.contracts` com cinco campos (`id BIGINT`, `contract_code NVARCHAR`, `amount DECIMAL(14,2)`, `status NVARCHAR`, `description NVARCHAR`) para `public.contracts`. A PK deve ser `id` com valores inteiros positivos; `IDENTITY` no próprio `id` é permitido. SQL Server JSON/XML, FLOAT, DATETIMEOFFSET, GUID/PK composta, schemas diferentes e múltiplas tabelas **ainda não estão implementados** na replicação de registros (embora o observador de metadados conheça outros tipos).
-4. **Canonicalização conservadora.** O SHA-256 é calculado em Python usando UTF-8, JSON estável, `DECIMAL` com duas casas e comparação literal de strings; `NULL` e string vazia são diferentes; alteração de collation ou tipo nativo bloqueia ciclos posteriores. Não se faz trim, uppercase/lowercase ou normalização Unicode que possa esconder drift.
-5. **Diferenças e deletes.** O extrator lê todos os registros da faixa via SQL Server, compara com o slot ativo local e emite Kafka `delta` para diferença. Emite `seen` para cada ID da faixa; o consumer só remove ID não visto após conferir hash/contagem, fim do lote e a política `MAX_REMOVE_FRACTION`. Falhas no meio da extração não promovem deletes.
-6. **Blue-green transacional.** O consumer e o journal V5 são reutilizados, inclusive retenção limitada de versão anterior para rollback. São *duas tabelas na mesma instância* PostgreSQL, não dois clusters. Para 700 GB, o tamanho local (duas cópias + índices + WAL) e o custo de replay do journal precisam ser medidos.
-7. **DDL SQL Server ainda fail-closed.** A V6 observa `sys.*`, armazena dicionários JSONB por versão e bloqueia qualquer alteração nativa inesperada, inclusive alteração de comprimento. Não inclui aprovação de `ADD COLUMN` vindo do SQL Server; essa evolução exigirá mapeamento de tipos e backfill próprios.
-8. **Isolamento de Kafka.** Um único tópico de dados com partição única preserva a ordem de `start`, `seen`, `delta`, `end`; não há paralelismo horizontal de milhares de faixas. O Kafka não faz backup do SQL Server por conta própria, e o histórico Kafka não é substituto para backups físicos.
-9. **Volume de 700 GB.** `--sweep-width` permite uma janela de até `MAX_SQLSERVER_SWEEP_WIDTH` (= 100.000 por padrão). Observe `remote_payload_json_bytes` (bytes da projeção JSON em Python, **não** bytes reais do TDS) e `kafka_bytes` para medir diferenças. O bootstrap completo implica leitura integral, assim como a cobertura eventual de todas as faixas. Não execute testes volumosos em origem sem janela e limites acordados.
-10. **DDL concorrente.** Um segundo catálogo é observado antes da emissão do evento de fechamento. Se o DDL mudar durante a transação, a leitura falha ou aborta. `pg_catalog` e `sys.*` não são um log histórico de alterações DDL.
-
-## 5. Testes
-
-```bash
-# Testes offline; não executam containers:
-python tests/check_static.py
-python tests/test_reconcile.py
-python tests/test_generation_paths.py
-python tests/test_schema_contract.py
-python tests/test_source_catalog.py
-python tests/test_mssql_contract.py
-python tests/test_mssql_paths.py
-
-# End-to-end: APAGA volumes Kafka/PostgreSQL/SQL Server deste Compose!
-LAB_RESET=1 bash tests/e2e_sqlserver_sync.sh
-```
-
-O E2E testa bootstrap, INSERT, UPDATE, hard DELETE, promoção blue-green, hashes, Unicode e bloqueio de DDL. Em ambiente sem Docker, apenas os testes offline são executáveis. **Não há comprovação de execução integrada Docker/SQL Server neste pacote.**
-
----
-
-## Apêndice: documentação V5 (origem PostgreSQL + schema evolution)
-
-# Kafka Restore Lab V5 — Schema Evolution + PostgreSQL / SQL Server Catalog
-
-**Laboratório experimental, não homologado em produção.** A V5 mantém a V4 (reconciliação por faixas de chave primária, detecção de INSERT / UPDATE / hard DELETE, Kafka e blue-green) e acrescenta um mecanismo de evolução de DDL **com aprovação humana**. Também inclui um observador de metadados multiplataforma capaz de ler os catálogos do SQL Server e PostgreSQL e registrar dicionários de schema versionados no PostgreSQL local.
-
-## Escopo executável
-
-| Recurso | PostgreSQL remoto | SQL Server remoto |
-|---|---|---|
-| Observação de colunas, tipos, PK, índices, constraints | Sim, `pg_catalog` | Sim, `sys.*` |
-| Dicionários nativo e lógico, SHA-256, diff, histórico JSONB | Sim | Sim |
-| Metadados observados com conta exclusivamente de leitura | Sim | Sim, sujeita à visibilidade de metadados |
-| Publicação de evidência em tópico Kafka de auditoria | Sim | Sim |
-| Reconciliar dados por faixa com hashes + Kafka | Sim | **Não nesta versão** |
-| Bootstrap / UPSERT / hard DELETE / blue-green de dados | Sim | **Não nesta versão** |
-| Detectar mudanças de DDL e bloquear sincronização de dados | Sim | Detecta; integração com gate de dados pendente |
-| Aprovar `ADD COLUMN TEXT NULL` + backfill + ativar view | Sim | **Não nesta versão** |
-
-**Não confundir:** o catálogo SQL Server está implementado para DDL, mas `bootstrap`, `incremental` e `schema apply/backfill/activate` continuam PostgreSQL→PostgreSQL. Para o SQL Server se tornar fonte de dados, será necessário implementar outro adaptador para leitura de faixas, transações/snapshot, normalização de valores e fingerprints comparáveis com os do PostgreSQL. Trocar somente a string de conexão não funciona.
-
-## 1. Arquitetura
-
-```text
-            PostgreSQL remoto             SQL Server remoto (opcional)
-               pg_catalog                        sys.*
-                    \                            /
-                     Schema Observer (source_catalog.py)
-                                │
-                         native_manifest
-                                │
-              normalização conservadora + dicionário
-                                │
-                   native_hash / logical_hash
-                                │
-                    Diff por nomes de colunas
-                                │
-         PostgreSQL local: source_catalog_observations (JSONB)
-                                │
-                     Kafka audit: SOURCE_DDL_OBSERVED
-
-PostgreSQL REMOTO (somente SELECT)
-          │
-          ├─ V4 range scan: chaves + SHA-256 + dados divergentes
-          │                     │
-          └─ V5 schema gate     │
-                    │           ▼
-               APP DDL     Kafka data topic
-                    │           │
-              APROVAÇÃO         ▼
-               EXPLÍCITA   Consumer + blue-green
-                    │           │
-          ADD COLUMN TEXT NULL em ambos os slots locais
-                    │
-             Backfill por faixas via Kafka
-                    │
-             Verificação das contagens e hashes
-                    │
-             Ativação transacional da public.contracts
-```
-
-**A origem permanece read-only para o middleware.** Apenas o PostgreSQL local recebe `ALTER TABLE`; os scripts que alteram a origem são fixtures descartáveis, isolados em serviços Docker com credenciais administrativas que não são expostas ao extrator/consumer.
-
-### Dicionários estruturais
-
-O `source_catalog.py` armazena **duas representações** por observação:
-
-- `native_manifest`: nomes, ordem, tipos nativos, precisão/escala, NULL, defaults, collation, PK, índices e constraints (conforme disponibilidade dos metadados).
-- `logical_manifest`: `columns` indexado pelo nome, tipos lógicos, PK, ordem, índices e constraints. Serve para comparação rápida e portabilidade. A transformação é conservadora, não perde o contrato nativo.
-
-`native_hash` detecta alterações específicas do banco, por exemplo `NVARCHAR(30)` → `NVARCHAR(100)` ou mudança de collation. `logical_hash` mede mudanças no contrato lógico, por exemplo `ADD COLUMN`, `DROP`, `NULL` → `NOT NULL`, `DECIMAL(14,2)` → `DECIMAL(16,4)`.
-
-Alterações detectadas recebem `review_adaptive_migration`, `review_required`, `native_only_review` ou `blocked`; **nenhuma mudança observada no SQL Server gera DDL automático**. Uma observação que não mudou não cria nova linha no histórico.
-
-As seguintes tabelas são criadas no PostgreSQL local:
-
-```text
-replica.source_catalog_observations  (engine-neutral native/logical JSONB)
-replica.schema_versions               (contrato PostgreSQL remoto ativo)
-replica.schema_state                  (active_hash e pending_hash)
-replica.schema_changes                (decisões de migração)
-replica.schema_backfill_runs          (lotes Kafka da nova coluna)
-replica.schema_backfill_values        (staging de valores por lote)
-replica.schema_backfill_intervals     (faixas concluídas)
-```
-
-## 2. Subir laboratório padrão (PostgreSQL → Kafka → PostgreSQL)
-
-```bash
-cd kafka_restore_lab_v5
-docker compose up -d --build
-docker compose run --rm cli chaos init
-
-# Primeira carga; depois, somente diferenças encontradas por faixa:
-docker compose run --rm cli bootstrap
-docker compose run --rm cli incremental --from-id 1 --sweep-width 1000
-
-docker compose run --rm cli status
-```
-
-Interfaces: Kafbat `http://localhost:8080`; Adminer `http://localhost:8081`. O arquivo `sql/remote.sql` cria a conta de leitura `remote_reader`; scripts de fixture que alteram a origem existem **apenas para o laboratório**.
-
-### Detectar e aprovar DDL aditivo (PostgreSQL como origem)
-
-```bash
-# Fixture fictícia: única conexão ADMIN ao PostgreSQL remoto no laboratório.
-docker compose exec -T remote-db psql -U postgres -d lab_remote -c \
-  'ALTER TABLE public.contracts ADD COLUMN currency_code TEXT;'
-
-# 1. Planejar; não altera o destino
-docker compose run --rm cli schema plan
-
-# 2. Operador aprova UMA coluna TEXT nullable, append-only, sem default
-docker compose run --rm cli schema apply
-
-# 3. Varreduras de backfill; repetir até marcar complete.
-docker compose run --rm cli schema backfill --sweep-width 1000
-docker compose run --rm cli schema status
-
-# 4. Ativar após todas as faixas estarem validadas
-docker compose run --rm cli schema activate
-
-# 5. Retomar reconciliação com o novo contrato
-docker compose run --rm cli incremental --from-id 1 --sweep-width 1000
-```
-
-`schema apply` prepara os dois slots locais sob barreira de migração, sem expor prematuramente a coluna na view. Durante backfill, a reconciliação normal e o rollback são bloqueados. `schema activate` amplia a view somente quando as faixas foram concluídas, a estrutura ainda coincide com a origem e não surgiram novos IDs fora do máximo registrado. Uma nova alteração da origem durante o backfill bloqueia a ativação; não se deve forçar a passagem de schema.
-
-Renomear/remover coluna, modificar tipo, NULL/NOT NULL, PK, constraints ou índices exige revisão manual. O protótipo não propaga índices arbitrários, sequences, roles, grants ou FKs de um banco inteiro. Após uma migração, rollback para uma geração anterior incompatível é rejeitado: blue-green de DDL não equivale a backup físico.
-
-## 3. SQL Server como origem OPCIONAL do catálogo
-
-**Requisitos:** Docker Compose, máquina com RAM suficiente (SQL Server Developer normalmente precisa de pelo menos ~2 GB), arquitetura de CPU suportada pela imagem. O serviço é opt-in e não é iniciado no cenário padrão. Portas expostas apenas no host local: PostgreSQL remoto `55432`, local `55433`, SQL Server `51433`.
-
-```bash
-# Inicia apenas o SQL Server fictício e os serviços locais necessários
-# (a primeira inicialização pode carregar imagens grandes)
-docker compose --profile mssql --profile mssql-tools up -d --build \
-  remote-sqlserver local-db kafka
-
-# Cria banco e usuário fictícios: somente no container SQL Server do lab
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture init
-
-# Faz inspeção, persistência em JSONB e envia evento de auditoria Kafka
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  catalog observe --engine sqlserver --source-key mssql-dbo-contracts
-
-# Admin sintético faz um ALTER TABLE; reader nunca recebe esse privilégio
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture add-column
-
-# Observa novo estado e registra o diff
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  catalog observe --engine sqlserver --source-key mssql-dbo-contracts
-
-# Outras mutações sintéticas para testar tipagem e DROP:
-docker compose --profile mssql --profile mssql-tools run --rm mssql-fixture change-length
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  catalog observe --engine sqlserver --source-key mssql-dbo-contracts
-
-docker compose --profile mssql --profile mssql-tools run --rm mssql-cli \
-  catalog history --source-key mssql-dbo-contracts
-```
-
-Para conectar a um SQL Server real, configure `MSSQL_HOST`, `MSSQL_PORT`, `MSSQL_DATABASE`, `MSSQL_USER` e `MSSQL_PASSWORD` no serviço de inspeção por secrets/variáveis de ambiente. **Não copie a senha fictícia deste Compose para qualquer ambiente real.** A conta SQL Server precisa ter `SELECT` na tabela e visibilidade dos metadados relevantes. Alguns textos de defaults, computed columns e outras definições podem exigir `VIEW DEFINITION`; valores invisíveis não devem ser tratados como expressão vazia.
-
-A inspeção SQL Server é repetida duas vezes para detectar alterações concorrentes durante a leitura do catálogo; isso é uma checagem de estabilidade, não uma garantia transacional universal. A operação captura **o estado atual** do schema, não o histórico literal de comandos `ALTER TABLE` executados entre observações.
-
-### Consultar dicionários no PostgreSQL local
-
-```sql
-SELECT observation_id, source_engine, object_name,
-       classification, observed_at, native_hash, logical_hash,
-       changes, native_changes
-FROM replica.source_catalog_observations
-WHERE source_key='mssql-dbo-contracts'
-ORDER BY observation_id DESC;
-
--- Acesso direto a coluna por chave de dicionário JSONB:
-SELECT logical_manifest #> '{columns,currency_code}' AS currency_code
-FROM replica.source_catalog_observations
-WHERE source_key='mssql-dbo-contracts'
-ORDER BY observation_id DESC LIMIT 1;
-
--- Tamanho nativo NVARCHAR/precisão e collation:
-SELECT jsonb_pretty(native_manifest) FROM replica.source_catalog_observations
-WHERE source_key='mssql-dbo-contracts'
-ORDER BY observation_id DESC LIMIT 1;
-```
-
-## 4. Testar
-
-```bash
-# Offline, sem Docker nem SQL Server:
-python tests/check_static.py
-python tests/test_reconcile.py
-python tests/test_generation_paths.py
-python tests/test_schema_contract.py
-python tests/test_source_catalog.py
-
-# E2E apenas contra volumes descartáveis do laboratório:
-LAB_RESET=1 bash tests/e2e_schema.sh
-LAB_SQLSERVER_TEST=1 bash tests/e2e_sqlserver_catalog.sh
-```
-
-**Atenção aos volumes:** o script `e2e_schema.sh` executa `docker compose down -v` para zerar os dados fictícios. Nunca use esse Compose e esses comandos contra instâncias reais. Se você já possui volumes de uma V4/V5 antiga, scripts SQL em `docker-entrypoint-initdb.d` NÃO executam novamente em volumes inicializados: recrie apenas volumes descartáveis ou migre o catálogo via SQL manualmente.
-
-Testes offline cobrem parser `sys.*` simulado, identificação de alterações nativas e lógicas, hash determinístico, segurança de identificadores, rejeição de DDL incompatível e caminhos de blue-green. **Não foi possível executar os testes Docker nem validar SQL Server real neste ambiente**. A inspeção SQL Server foi verificada com fixtures de metadados, não contra um servidor real.
-
-## 5. Limitações para 700 GB e próxima evolução
-
-- O transporte é incremental **em diferenças**, mas a auditoria precisa ler dados da origem por faixas. Sem `updated_at`, `deleted_at`, CDC/WAL ou log autorizado, nenhum motor pode detectar toda mudança sem cobrir a fonte ao longo de um ciclo.
-- O laboratório de dados atual é PostgreSQL→PostgreSQL, PK `BIGINT`, uma tabela, um tópico Kafka de dados com partição única. Para uma fonte SQL Server, precisamos de uma estratégia de isolamento/snapshot que a origem efetivamente suporte (por exemplo `SNAPSHOT` habilitado pelo DBA); não presumir que `READ COMMITTED` seja consistente entre múltiplas consultas.
-- O driver SQL Server não utiliza o fingerprint PostgreSQL `jsonb_build_array(... )::text`. Para ampliar o reconciliador será necessário definir serialização canônica dos valores, parâmetros de collation/tipos, `NULL`, datas, timezones, unicode e DECIMAL, ou um mecanismo de comparação independente. `HASHBYTES('SHA2_256', ...)` existe, mas não resolve sozinho essas divergências de representação.
-- Uma definição nativa `NVARCHAR(30)` e `NVARCHAR(100)` pode gerar o mesmo tipo lógico `text`; por isso persistimos **native_hash e native_changes além dos hashes lógicos**. Alterações de collation devem ser revisadas antes de promover dados.
-- Apenas `ADD COLUMN TEXT NULL` no final da tabela é automaticamente elegível para aprovação humana **quando a origem de dados é PostgreSQL**. SQL Server pode adicionar `NVARCHAR`, mas isso ainda não autoriza aplicar DDL local sem mapeamento e testes.
-- Blue-green do laboratório usa duas tabelas na mesma instância PostgreSQL, não duas instâncias independentes; não substitui alta disponibilidade ou backup físico. A V5 protege promoções de schemas incompatíveis e não executa SQL arbitrário vindo do Kafka.
-
-**Conclusão:** a camada de *catalog/schema parsing* agora pode ser independente de PostgreSQL/SQL Server. A camada de reconciliação de dados ainda não. Essa separação é deliberada para evitar falsos positivos de atualização/deleção em um banco de 700 GB.
+Pare ou remova cada cenário antes de executar o seguinte, pois os projetos publicam as mesmas portas. Esses scripts não devem compartilhar volumes com o tutorial ou com dados que você queira preservar.
+
+## Limites do experimento
+
+- Sem `updated_at`, `deleted_at`, CDC ou logs de mudança, a detecção depende da leitura das faixas. Alterações posteriores à leitura de uma faixa precisam de outro ciclo.
+- O escopo é uma tabela de contratos, PK numérica e um tópico de dados com partição única. Não replica automaticamente um banco inteiro, sequences, roles, grants, FKs ou índices arbitrários.
+- A extração SQL Server lê todo o conteúdo da faixa para calcular os hashes em Python. A redução de payload no Kafka não elimina o custo de leitura e rede entre origem e extrator.
+- Bootstrap e faixas grandes podem exigir memória, disco e tempo significativos. O destino mantém duas cópias físicas dos contratos, além de staging, journal e índices.
+- Blue-green ocorre em duas tabelas da mesma instância PostgreSQL. Rollback depende da geração disponível e da compatibilidade do schema; não substitui backup nem alta disponibilidade física.
+- O monitor oferece sinais operacionais locais. Não certifica igualdade simultânea da base inteira, disponibilidade atual da origem ou RPO global.
