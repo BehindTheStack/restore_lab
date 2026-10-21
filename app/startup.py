@@ -22,6 +22,10 @@ def initialize(connect, prepare_proxy, publish_bootstrap, log, *,
     with connect() as conn:
         if not conn.execute('SELECT pg_try_advisory_lock(70261022)').fetchone()[0]:
             raise RuntimeError('Another initializer is running')
+        # Init SQL does not run again for existing PostgreSQL volumes.
+        # Repair the SELECT required by the monitor's ancestry query here too.
+        conn.execute('GRANT SELECT ON replica.generations TO monitor_reader')
+        log('startup_monitor_permissions_ready')
         active = conn.execute('''SELECT version FROM replica.active_state
                                  WHERE singleton''').fetchone()
         if active is None:

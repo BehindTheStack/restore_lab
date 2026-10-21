@@ -40,6 +40,7 @@ class Destination:
         self.lock_available = True
         self.has_generations = False
         self.closed = False
+        self.can_read_generations = False
 
     def __enter__(self):
         return self
@@ -51,6 +52,9 @@ class Destination:
         sql = ' '.join(sql.split())
         if 'pg_try_advisory_lock' in sql:
             return Result((self.lock_available,))
+        if sql == 'GRANT SELECT ON replica.generations TO monitor_reader':
+            self.can_read_generations = True
+            return Result(None)
         if sql.startswith('SELECT version FROM replica.active_state'):
             return Result(self.active)
         if sql.startswith('SELECT run_id FROM replica.sync_runs'):
@@ -103,11 +107,12 @@ class StartupTest(unittest.TestCase):
         self.publish.assert_called_once_with()
         self.log.assert_called_with('startup_already_initialized', version=1)
 
-    def test_existing_destination_only_prepares_proxy(self):
+    def test_existing_destination_repairs_monitor_permission_without_bootstrap(self):
         self.destination.active = (42,)
         self.initialize()
         self.proxy.assert_called_once_with()
         self.publish.assert_not_called()
+        self.assertTrue(self.destination.can_read_generations)
         self.assertEqual(self.clock.now, 0)
 
     def test_pending_bootstrap_is_resumed_without_publication(self):

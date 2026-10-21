@@ -70,15 +70,21 @@ await_query 'SELECT count(*) FROM public.contracts' 10000
 compose exec -T monitor python -c \
   "import json,urllib.request; assert json.load(urllib.request.urlopen('http://localhost:8082/readyz'))['dependencies_ready']"
 
-echo '[2/4] Restart reuses persisted data without a second bootstrap'
+echo '[2/4] Restart repairs legacy monitor permission without a second bootstrap'
 compose stop scheduler
 await_query "SELECT count(*) FROM replica.sync_runs WHERE status IN ('extracting','loading')" 0
 startup_incrementals="$(read_local "SELECT count(*) FROM replica.sync_runs WHERE mode='incremental' AND status='promoted'")"
+read_local 'REVOKE SELECT ON replica.generations FROM monitor_reader;'
+compose exec -T monitor python -c \
+  "import json,urllib.request; s=json.load(urllib.request.urlopen('http://localhost:8082/status.json')); assert s['local_db']['connected'] and s['local_db']['error_code']=='42501'; assert any(a['code']=='LOCAL_DB_READ_ERROR' for a in s['alarms'])"
 compose stop
 compose up -d --no-build
 compose run --rm --no-deps init
 await_query "SELECT count(*) FROM replica.sync_runs WHERE mode='bootstrap'" 1
 await_query "SELECT count(*) > $startup_incrementals FROM replica.sync_runs WHERE mode='incremental' AND status='promoted'" t
+await_query "SELECT has_table_privilege('monitor_reader','replica.generations','SELECT')" t
+compose exec -T monitor python -c \
+  "import json,urllib.request; assert json.load(urllib.request.urlopen('http://localhost:8082/readyz'))['dependencies_ready']"
 compose stop
 
 echo '[3/4] Pending bootstrap times out without republishing or enabling scheduler'
