@@ -4,6 +4,8 @@ Laboratório de reconciliação de contratos de uma origem PostgreSQL ou SQL Ser
 
 O projeto demonstra carga inicial, sincronização por faixas de chave primária, detecção de exclusões físicas, rollback, inspeção de schema e testes de falhas de rede. Os bancos de origem do Compose contêm dados fictícios. O laboratório não foi homologado para produção nem para bases de centenas de gigabytes.
 
+No cenário PostgreSQL padrão, `docker compose up -d --build` prepara o proxy, publica o bootstrap somente no destino ainda não inicializado, aguarda a promoção pelo consumer e inicia a reconciliação periódica. O monitor também sobe nesse comando.
+
 ## Como o fluxo funciona
 
 ```mermaid
@@ -122,11 +124,12 @@ Serviços sem profile iniciam com `docker compose up -d --build`. Os demais são
 | `consumer` | Padrão | Processo contínuo que consome Kafka, valida os lotes, aplica diferenças e promove o slot local. |
 | `cli` | `tools` | Interface de operação PostgreSQL: carga inicial, incremental, status, rollback, schema, catálogo e falhas de rede. |
 | `seed-fixture` | `tools` | Gera ou altera dados fictícios no PostgreSQL remoto. É o serviço com credencial administrativa dessa origem para `seed` e `mutate`. |
-| `scheduler` | `scheduled` | Executa incrementais PostgreSQL em sequência, com pausa de 60 segundos entre tentativas e faixas de 1.000 IDs. Exige bootstrap concluído. |
+| `init` | Padrão | Prepara o proxy e consulta o estado persistido. Publica o primeiro bootstrap ou retoma a espera de um lote existente. Só termina com sucesso após haver uma carga promovida. |
+| `scheduler` | Padrão | Inicia após o sucesso de `init`. Executa incrementais PostgreSQL em sequência, com pausa de 60 segundos entre tentativas e faixas de 1.000 IDs. |
 | `mssql-cli` | `mssql-tools` | Interface de extração e catálogo SQL Server. Usa `remote_reader`, representação canônica e o mesmo pipeline Kafka/consumer. |
 | `mssql-fixture` | `mssql-tools` | Usa a conta administrativa do SQL Server fictício para criar banco, tabela, 100 contratos, conta de leitura e habilitar isolamento SNAPSHOT. Também oferece mutações de dados e DDL para testes. |
 | `mssql-scheduler` | `mssql-scheduled` | Executa incrementais SQL Server com pausa de 60 segundos e faixas de 1.000 IDs. Exige fixture e bootstrap concluídos. |
-| `monitor` | `monitor` | Painel HTTP de saúde da reconciliação. Consulta auditoria com `monitor_reader` e metadados Kafka; não aplica correções. |
+| `monitor` | Padrão | Painel HTTP de saúde da reconciliação. Consulta auditoria com `monitor_reader` e metadados Kafka; não aplica correções. |
 | `kafbat` | Padrão | Interface web para examinar brokers, tópicos, mensagens, grupos de consumidores e lag. |
 | `adminer` | Padrão | Interface web para acessar o banco local e consultar dados, estruturas e auditoria. |
 
@@ -137,6 +140,7 @@ Serviços sem profile iniciam com `docker compose up -d --build`. Os demais são
 | `docker-compose.yml` | Define serviços, profiles, conexões, portas, volumes e parâmetros do laboratório. |
 | `app/Dockerfile` e `app/requirements.txt` | Constroem a imagem Python compartilhada e instalam os drivers PostgreSQL, Kafka e SQL Server. |
 | `app/lab.py` | Entrada da CLI, extrator PostgreSQL, protocolo Kafka, consumer, blue-green, rollback, scheduler e comandos de fixture. |
+| `app/startup.py` | Coordena a preparação do proxy e o bootstrap inicial, aguarda a promoção e impede republicação de uma tentativa já registrada. |
 | `app/mssql_sync.py` | Adaptador de extração SQL Server: leitura SNAPSHOT, comparação por faixa e publicação no Kafka. |
 | `app/canonical_contract.py` | Valida o contrato SQL Server e normaliza IDs, Unicode, valores nulos e decimais para comparação determinística. |
 | `app/schema_evolution.py` | Inspeção e controle do schema PostgreSQL, planejamento de DDL, preparação local, backfill e ativação. |
@@ -145,7 +149,6 @@ Serviços sem profile iniciam com `docker compose up -d --build`. Os demais são
 | `app/monitor.py` | Coleta sinais operacionais e fornece dashboard, detalhes de execuções e endpoints HTTP. |
 | `sql/remote.sql` | Inicialização da origem PostgreSQL fictícia e concessão de leitura ao extrator. |
 | `sql/local.sql` | Inicialização do destino, tabelas de controle, view pública e permissões do monitor. |
-| `sql/monitor_upgrade.sql` | Repara ou complementa estruturas de controle em um volume local já inicializado, com verificações de consistência. |
 | `tests/` | Verificações offline e scripts de integração com Docker. |
 
 ## Requisitos
@@ -163,7 +166,7 @@ Execute os comandos na raiz deste repositório, onde está `docker-compose.yml`.
 |---|---|---|
 | `http://localhost:8080` | Kafbat | Inspeção do Kafka. |
 | `http://localhost:8081` | Adminer | SQL e auditoria. |
-| `http://localhost:8082` | Monitor | Saúde e progresso; exige o profile `monitor`. |
+| `http://localhost:8082` | Monitor | Saúde e progresso; incluído na subida padrão. |
 | `localhost:55432` | PostgreSQL remoto | Banco `lab_remote`. |
 | `localhost:55433` | PostgreSQL local | Banco `lab_local`. |
 | `localhost:51433` | SQL Server remoto | Disponível no cenário SQL Server. |
@@ -178,21 +181,40 @@ As portas publicadas estão vinculadas a `127.0.0.1`. Dentro da rede Docker, os 
 
 ```bash
 docker compose up -d --build
-docker compose --profile monitor up -d --build monitor
-docker compose ps
-docker compose run --rm cli chaos init
+docker compose ps -a
 ```
 
-O PostgreSQL executa os scripts de inicialização somente na criação dos volumes. Em uma instalação nova, a origem recebe 10.000 contratos e o destino começa sem carga promovida. Se já existem volumes, consulte a seção de manutenção antes de continuar.
+O PostgreSQL executa os scripts SQL de inicialização somente na criação dos volumes. Em uma instalação nova, a origem recebe 10.000 contratos. O serviço `init` prepara o proxy, publica essa carga e aguarda o consumer. O scheduler depende de `init` com a condição `service_completed_successfully`, por isso só começa depois da promoção. O monitor fica disponível durante essa preparação.
 
-### 2. Fazer a carga inicial
+```mermaid
+flowchart TB
+    up["docker compose up -d --build"] --> infra["Iniciar bancos, Kafka, Toxiproxy,<br/>consumer e interfaces"]
+    infra --> proxy["init: aguardar API e preparar proxy"]
+    proxy --> active{"Já existe geração ativa?"}
+    active -->|"Sim"| ready["init termina com sucesso"]
+    active -->|"Não"| previous{"Já existe tentativa de bootstrap?"}
+    previous -->|"Não"| publish["Publicar bootstrap uma vez"]
+    previous -->|"Sim"| wait["Consultar o lote existente"]
+    publish --> wait
+    wait --> result{"Resultado do consumer?"}
+    result -->|"Pendente"| wait
+    result -->|"Promovido"| ready
+    result -->|"Falha, rejeição, aborto ou timeout"| blocked["init termina com erro<br/>Scheduler não inicia"]
+    ready --> schedule["Iniciar scheduler<br/>Incrementais por faixa a cada ciclo"]
+```
+
+É normal `init` aparecer como `Exited (0)` após concluir. Em novas subidas com os mesmos volumes, ele encontra a geração ativa e não republica o bootstrap. Se houver um bootstrap pendente, aguarda o mesmo lote. Uma tentativa registrada como falha, rejeitada ou abortada exige diagnóstico e recuperação pelo operador.
+
+Por padrão, `init` espera até 60 segundos pela API do proxy e até 600 segundos pela promoção após a publicação. Ajuste `--ready-timeout` e `--promotion-timeout` no comando do serviço se necessário. Um timeout não apaga nem republica o lote.
+
+### 2. Conferir a carga inicial
 
 ```bash
-docker compose run --rm cli bootstrap
 docker compose run --rm cli status
+docker compose logs --tail 100 init scheduler consumer
 ```
 
-A extração e o consumo são assíncronos. Aguarde a execução aparecer como `promoted` no monitor ou no `status` antes de iniciar outro lote. `extracting` e `loading` indicam trabalho ainda pendente.
+A carga inicial já foi publicada automaticamente. Confira o bootstrap como `promoted`; as execuções seguintes serão incrementais do scheduler. `extracting` e `loading` indicam trabalho ainda pendente. Não execute `bootstrap` novamente em um destino com geração ativa.
 
 Confira o resultado no banco local:
 
@@ -205,9 +227,12 @@ Em volumes novos e sem outras mutações, o resultado esperado é `10000`.
 
 ### 3. Simular inclusão, alteração e exclusão
 
-Os comandos abaixo modificam exclusivamente a origem fictícia do laboratório. Execute o conjunto uma vez sobre os dados iniciais:
+Os comandos abaixo modificam exclusivamente a origem fictícia do laboratório. Para controlar a faixa manualmente, pare o scheduler e confirme em `status` que não há lote pendente. Ao receber a parada, ele termina a publicação em andamento antes de sair; aguarde também o consumer promover esse lote. Execute o conjunto uma vez sobre os dados iniciais:
 
 ```bash
+docker compose stop scheduler
+docker compose run --rm cli status
+
 docker compose run --rm seed-fixture mutate update 1
 docker compose run --rm seed-fixture mutate hard-delete 2
 docker compose run --rm seed-fixture mutate insert 10001
@@ -232,16 +257,16 @@ O tamanho da faixa conta posições de IDs, não linhas existentes. Uma alteraç
 # Sem --from-id, retoma next_sweep_id; volta ao início ao superar o maior ID.
 docker compose run --rm cli incremental --sweep-width 1000
 
-# Aguarde esse lote aparecer como promoted antes de iniciar o scheduler.
-# Opcional: automatiza os próximos incrementais.
-docker compose --profile scheduled up -d --build scheduler
+# Aguarde esse lote aparecer como promoted antes de retomar o scheduler.
+docker compose up -d scheduler
 docker compose logs -f scheduler consumer
 ```
 
-O scheduler não faz bootstrap. A pausa de 60 segundos é somada ao tempo de cada tentativa. Para retomar os exercícios manuais, interrompa-o:
+O serviço `init` cuida do bootstrap; o scheduler executa apenas incrementais. A pausa de 60 segundos é somada ao tempo de cada tentativa. Para retomar os exercícios manuais, interrompa-o e aguarde qualquer lote pendente concluir:
 
 ```bash
-docker compose --profile scheduled stop scheduler
+docker compose stop scheduler
+docker compose run --rm cli status
 ```
 
 ### 5. Testar rollback
@@ -260,12 +285,12 @@ O rollback seleciona a geração validada disponível no outro slot. Ele exige s
 Este cenário usa um destino próprio: não faça um segundo bootstrap no destino já carregado pelo tutorial PostgreSQL. O exemplo abaixo usa outro nome de projeto para separar os volumes. Como as portas são as mesmas, pare o cenário PostgreSQL antes de iniciar o SQL Server.
 
 ```bash
-docker compose --profile monitor --profile scheduled stop
+docker compose stop
 
 # Função Bash: mantenha este prefixo em todas as operações deste cenário.
 mssql_lab() {
   docker compose -p kafka-restore-sqlserver \
-    --profile mssql --profile mssql-tools --profile monitor "$@"
+    --profile mssql --profile mssql-tools "$@"
 }
 
 mssql_lab up -d --build \
@@ -278,7 +303,7 @@ mssql_lab run --rm mssql-cli bootstrap
 mssql_lab run --rm mssql-cli status
 ```
 
-Aguarde `promoted` antes da próxima etapa. A fixture cria 100 contratos em `dbo.contracts`, habilita `ALLOW_SNAPSHOT_ISOLATION` e prepara `remote_reader` com leitura. O serviço `remote-db` também sobe porque é dependência do Toxiproxy no Compose; a extração deste cenário usa o SQL Server.
+Aguarde `promoted` antes da próxima etapa. A fixture cria 100 contratos em `dbo.contracts`, habilita `ALLOW_SNAPSHOT_ISOLATION` e prepara `remote_reader` com leitura. O serviço `remote-db` também sobe porque é dependência do Toxiproxy no Compose; a extração deste cenário usa o SQL Server. A lista explícita de serviços deixa `init` e `scheduler` PostgreSQL desligados. Neste cenário opcional, a preparação da fixture e o bootstrap continuam manuais.
 
 ```bash
 mssql_lab run --rm mssql-fixture mutate-insert
@@ -349,7 +374,7 @@ As tabelas `replica.blue_contracts` e `replica.green_contracts` guardam os dados
 
 ### Ajustar os alertas
 
-Edite o ambiente de `monitor` em `docker-compose.yml` e recrie o serviço com `docker compose --profile monitor up -d monitor`.
+Edite o ambiente de `monitor` em `docker-compose.yml` e recrie o serviço com `docker compose up -d monitor`.
 
 | Variável | Padrão | Efeito |
 |---|---|---|
@@ -454,14 +479,15 @@ Para observar o consumo assíncrono, pare `consumer`, execute um incremental, co
 | `Previous batch pending` | Consulte `status`, logs e mensagens no Kafbat. Resolva o lote anterior antes de iniciar outro. |
 | Lote `extracting` ou `loading` por muito tempo | Verifique consumer, Kafka, evento `end` e erros do extrator. A duração sozinha não autoriza descartar o lote. |
 | Lote `rejected` | Leia `error` em `replica.sync_runs`. Pode haver divergência de hash, geração base ou limite de exclusão. |
+| `init` com erro e scheduler sem iniciar | Confira os logs de `init` e consumer. Um bootstrap pendente será reutilizado; uma tentativa terminal não será republicada automaticamente. Após resolver a causa, execute `docker compose up -d init scheduler`. |
 | Exclusões bloqueadas | `MAX_REMOVE_FRACTION`, configurado no **consumer**, limita a fração removida na faixa e no total local; padrão `0.20`. Investigue a origem antes de ajustar. |
 | Schema divergente | Consulte `schema plan` no PostgreSQL ou o histórico de catálogo SQL Server; siga o procedimento de revisão. |
-| Monitor com erro de tabela/permissão | Confira inicialização do banco e aplique o reparo de estruturas locais quando necessário. |
+| Monitor ou `init` com erro de tabela/permissão | Confira os logs de inicialização do banco e o schema do volume. Scripts de inicialização não são reaplicados em volumes existentes. |
 | Origem indisponível | Confira logs, estado do proxy e credenciais. Use `chaos clear` para encerrar a simulação. |
 
 ```bash
 docker compose logs --tail 100 consumer local-db kafka toxiproxy
-docker compose --profile monitor logs --tail 100 monitor
+docker compose logs --tail 100 monitor init scheduler
 ```
 
 Para um lote realmente abandonado, a CLI oferece `abandon --run-id <UUID> --force` e `schema abandon --run-id <UUID> --force` para backfill. Antes de usar, confirme que não há produtor ativo nem evento `end` já publicado ou em fila. Esses comandos publicam um aborto ordenado; não desfazem uma promoção que já ocorreu.
@@ -487,34 +513,36 @@ As senhas do Compose são de laboratório: `lab-admin` para o administrador Post
 
 Os volumes `remote_data`, `local_data`, `kafka_data` e `mssql_data` persistem os bancos e o Kafka. O projeto Compose padrão se chama `kafka-restore-lab`; o tutorial SQL Server usa `kafka-restore-sqlserver`. Mudar o nome do projeto cria outro conjunto de volumes. Use o mesmo prefixo de projeto em todas as operações do cenário.
 
-### Reutilizar ou reparar um volume local
+### Reutilizar um volume local
 
-Scripts em `docker-entrypoint-initdb.d` não são executados novamente em volumes inicializados. Para um volume que já tenha as tabelas base blue-green, pare produtores, consumer e monitor antes de aplicar o script local. Exemplo para o cenário PostgreSQL:
+Scripts em `docker-entrypoint-initdb.d` não são executados novamente em volumes inicializados. O serviço `init` usa `replica.active_state` e `replica.sync_runs` para decidir se precisa da primeira carga; ele não executa migrações de schema nem recria tabelas existentes.
+
+Com um volume já inicializado corretamente, basta usar o mesmo nome de projeto e subir o ambiente:
 
 ```bash
-docker compose --profile scheduled --profile monitor stop scheduler consumer monitor
-docker compose up -d local-db kafka
-
-docker compose exec -T local-db psql -X -v ON_ERROR_STOP=1 -U postgres -d lab_local \
-  < sql/monitor_upgrade.sql
-
-docker compose up -d --build consumer
-docker compose --profile monitor up -d --build monitor
+docker compose up -d --build
+docker compose run --rm cli status
 ```
 
-O script é transacional, pode ser repetido e não apaga os contratos. Ele complementa estruturas de schema, catálogo, auditoria e cobertura, corrige a restrição de estado de schema conhecida e concede as leituras do monitor. Recusa o reparo se faltarem as tabelas base ou se não conseguir estabelecer um estado consistente para gerações existentes. Revise qualquer erro antes de reiniciar os processos; não tente corrigir apagando volumes com dados necessários.
+Se faltarem tabelas de controle ou houver inconsistência entre gerações e estado ativo, a inicialização falha e impede a subida do scheduler. Inspecione os logs e planeje o reparo SQL do volume antes de tentar novamente. Não reaplique `sql/local.sql` inteiro sobre um banco existente e não apague volumes com dados necessários.
 
-Para o cenário SQL Server, use o prefixo `mssql_lab` e pare também `mssql-scheduler`. Checkpoints não são criados retroativamente para execuções passadas. Retome o scheduler somente depois de verificar o estado local.
+O monitor precisa de leitura em `replica.generations` para calcular a cobertura por linhagem. Instalações novas já recebem essa permissão. Se um volume existente apresentar `permission denied for table generations` no painel, aplique a concessão local:
+
+```bash
+docker compose exec -T local-db psql -v ON_ERROR_STOP=1 -U postgres -d lab_local -c \
+  'GRANT SELECT ON replica.generations TO monitor_reader;'
+```
+
+Se a primeira tentativa de bootstrap terminou em `failed`, `rejected` ou `aborted`, resolva a causa antes de publicar uma nova carga manualmente com `docker compose run --rm cli bootstrap`. Depois, execute `docker compose up -d init scheduler` para aguardar a promoção e liberar os incrementais. Para lotes ainda pendentes, não publique outro bootstrap: retome o consumer e a inicialização, que aguardará o lote já registrado.
 
 ### Parar e retomar
 
 ```bash
 # Cenário PostgreSQL: preserva os volumes.
-docker compose --profile monitor --profile scheduled stop
+docker compose stop
 
-# Retoma a infraestrutura e o monitor; não repete o bootstrap.
-docker compose up -d
-docker compose --profile monitor up -d monitor
+# Retoma o ambiente; init reutiliza a carga e libera o scheduler.
+docker compose up -d --build
 ```
 
 Para o cenário SQL Server, pare com `mssql_lab --profile mssql-scheduled stop` e retome os serviços usando o mesmo comando `mssql_lab up` do tutorial, sem executar fixture ou bootstrap novamente. `docker compose down` remove containers e rede, preservando os volumes nomeados; `docker compose down -v` também apaga os dados persistidos.
@@ -532,6 +560,7 @@ python3 tests/test_source_catalog.py
 python3 tests/test_mssql_contract.py
 python3 tests/test_mssql_paths.py
 python3 tests/test_monitor.py
+python3 tests/test_startup.py
 ```
 
 Os testes cobrem contratos, hashes, caminhos de geração/rollback, evolução de schema, catálogo e regras do monitor com simulações. Não substituem os testes com bancos reais.
@@ -540,6 +569,12 @@ Com o cenário PostgreSQL inicializado e o monitor ativo, há um smoke test de l
 
 ```bash
 LAB_MONITOR_SMOKE=1 bash tests/e2e_monitor.sh
+```
+
+O teste de inicialização cria projetos próprios sem portas publicadas e remove somente esses volumes ao terminar. Verifica a subida padrão, bootstrap único, promoção anterior aos incrementais, monitor, reinício e retomada de bootstrap pendente:
+
+```bash
+LAB_STARTUP_TEST=1 bash tests/e2e_startup.sh
 ```
 
 Os testes de integração seguintes **alteram dados e estruturas**. `e2e_schema.sh` e `e2e_sqlserver_sync.sh` também removem os volumes do projeto. Execute-os somente em um projeto descartável, com portas disponíveis; cada comando abaixo cria um cenário separado:
