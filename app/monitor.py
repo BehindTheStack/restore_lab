@@ -254,8 +254,15 @@ def evaluate(snapshot):
     def alert(level, key, msg, action):
         alarms.append({'severity':level,'code':key,'message':msg,'action':action})
     if not snapshot['local_db']['ok']:
-        alert('critical','LOCAL_DB_DOWN','PostgreSQL local indisponível',
-              'Conferir healthcheck, logs e disponibilidade do banco local.')
+        if snapshot['local_db'].get('connected'):
+            action = ('Executar a inicialização para recompor a leitura de monitor_reader.'
+                      if snapshot['local_db'].get('error_code') == '42501' else
+                      'Conferir o schema local e o erro da consulta de auditoria.')
+            alert('critical','LOCAL_DB_READ_ERROR','Falha na leitura da auditoria local',
+                  action + ' ' + (snapshot['local_db'].get('error') or ''))
+        else:
+            alert('critical','LOCAL_DB_DOWN','PostgreSQL local indisponível',
+                  'Conferir healthcheck, logs e disponibilidade do banco local.')
     if not snapshot['kafka']['ok']:
         alert('critical','KAFKA_DOWN','Kafka ou tópico de dados indisponível',
               'Inspecionar broker e tópico no Kafbat.')
@@ -310,7 +317,8 @@ def evaluate(snapshot):
 
 def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka):
     now=now or datetime.now(timezone.utc)
-    state={'checked_at':now.isoformat(),'local_db':{'ok':False,'error':None},
+    state={'checked_at':now.isoformat(),'local_db':{'ok':False,'connected':False,
+                                                'error':None,'error_code':None},
            'kafka':{'ok':False},'active':None,'schema':None,
            'metrics':{},'coverage':{'status':'unknown'},'recent_runs':[],
            'catalog':[],'last_ranges':[],'alarms':[], 'overall':'unavailable',
@@ -323,10 +331,12 @@ def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka)
            ]}
     try:
         with connect(LOCAL_DSN,connect_timeout=3) as conn:
+            state['local_db']['connected']=True
             state.update(_query_db(conn,now))
         state['local_db']['ok']=True
     except Exception as exc:
         state['local_db']['error']=f'{type(exc).__name__}: {str(exc)[:230]}'
+        state['local_db']['error_code']=getattr(exc,'sqlstate',None)
     try:
         state['kafka']=kafka_probe()
     except Exception as exc:
@@ -352,6 +362,8 @@ def render_html(s):
                  'attention':'Atenção operacional','not_initialized':'Bootstrap pendente',
                  'unavailable':'Falha operacional'}[s['overall']]
     runtime='good' if s['local_db']['ok'] else 'bad'
+    db_label=('Acessível' if s['local_db']['ok'] else
+              'Erro de leitura' if s['local_db'].get('connected') else 'Indisponível')
     kafka_state='good' if k.get('ok') else 'bad'
     if group.get('lag') is None: group_state='unknown';lag='Não medido'
     else:
@@ -388,7 +400,7 @@ def render_html(s):
                f"{_safe(k.get('partitions'))} partições de dados",'kafka'),
         _stage('Consumer',f'Lag: {lag}',group_state,
                f"{_safe(group.get('members'))} membros no grupo",'kafka'),
-        _stage('PostgreSQL local','Acessível' if s['local_db']['ok'] else 'Indisponível',runtime,
+        _stage('PostgreSQL local',db_label,runtime,
                'Auditoria SQL persistida','destination'),
         _stage('Blue-green',f"{_safe(a.get('slot'))} · v{_safe(a.get('version'))}",
                'good' if a.get('version') else 'unknown','Promoção transacional','destination'),
@@ -462,6 +474,7 @@ volume trafegado ou consistência transacional de todo o remoto. Sem meta de cob
 <p class="subtle">{_safe(k.get('error') or k.get('group_error'))}</p>
 </section></div>
 <div class="columns"><section class="section" id="destination"><h2>Destino e blue-green</h2>
+{('<p class="alert critical">' + _safe(s['local_db'].get('error')) + '</p>') if s['local_db'].get('error') else ''}
 <div class="facts"><div><small>BLUE v</small><b>{_safe(a.get('blue_version'))}</b></div>
 <div><small>GREEN v</small><b>{_safe(a.get('green_version'))}</b></div>
 <div><small>Ativo</small><b>{_safe(a.get('slot'))}</b></div></div>

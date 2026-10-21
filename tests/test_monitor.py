@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import types
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 root=Path(__file__).resolve().parents[1]
@@ -99,6 +100,32 @@ def test_end_to_end_snapshot_fake():
     assert 'Kafbat UI' in markup
 
 
+def test_database_read_failure_is_distinct_from_connection_failure():
+    class PermissionDenied(RuntimeError):
+        sqlstate = '42501'
+
+    kafka_probe = lambda: {'ok':True,'audit_topic':True,'group':{}}
+    error = PermissionDenied('permission denied for table generations <details>')
+    with patch.object(m, '_query_db', side_effect=error):
+        snap = m.load_snapshot(connect=lambda *a, **kw: DB(), kafka_probe=kafka_probe)
+    assert snap['local_db']['connected'] and not snap['local_db']['ok']
+    assert snap['local_db']['error_code'] == '42501'
+    codes = {alarm['code'] for alarm in snap['alarms']}
+    assert 'LOCAL_DB_READ_ERROR' in codes and 'LOCAL_DB_DOWN' not in codes
+    markup = m.render_html(snap)
+    assert 'Erro de leitura' in markup
+    assert 'permission denied for table generations &lt;details&gt;' in markup
+    assert '<details>' not in markup
+
+    def offline(*args, **kwargs):
+        raise OSError('connection refused')
+
+    snap = m.load_snapshot(connect=offline, kafka_probe=kafka_probe)
+    assert not snap['local_db']['connected'] and not snap['local_db']['ok']
+    codes = {alarm['code'] for alarm in snap['alarms']}
+    assert 'LOCAL_DB_DOWN' in codes and 'LOCAL_DB_READ_ERROR' not in codes
+
+
 def test_permissions_and_protocol():
     src=(root/'app/monitor.py').read_text()
     assert 'REMOTE_DSN' not in src and 'docker.sock' not in src
@@ -112,6 +139,8 @@ def test_permissions_and_protocol():
     assert 'CREATE TABLE replica.range_checkpoints' in (root/'sql/local.sql').read_text()
 
 if __name__=='__main__':
-    for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,test_permissions_and_protocol):
+    for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,
+                 test_database_read_failure_is_distinct_from_connection_failure,
+                 test_permissions_and_protocol):
         test()
     print('PASS full health: coverage, alerts, readonly, SQL, UI')
