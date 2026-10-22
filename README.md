@@ -286,6 +286,56 @@ O rollback alterna para a geração anterior somente quando o schema é compatí
 
 Uma guarda rejeita lotes com remoção acima de `MAX_REMOVE_FRACTION` (padrão `0.20`, configurado no **consumer**). Isso também se aplica a exclusões físicas legítimas: numa tabela de três linhas, excluir uma supera 20%. Sem PK, a guarda usa a redução líquida da contagem. Uma rejeição preserva a publicação anterior. Ajustar o limite exige recriar o consumer com a configuração escolhida e iniciar uma nova leitura após revisar a origem.
 
+### Aplicar uma exclusão intencional bloqueada por `Deletion guard`
+
+O fluxo é **origem remota → destino local**. Este procedimento permite refletir no destino uma exclusão já confirmada na origem; a aplicação continua usando somente SELECT remoto. O lote rejeitado permanece no histórico: é necessária uma nova leitura, que gera outro lote.
+
+O limite é a fração removida em relação à última publicação da tabela. Por exemplo, `Deletion guard: 2/5, limit=20.00%` significa que duas das cinco linhas seriam removidas (40%). Nesse caso, um limite temporário de `0.50` comporta a exclusão. **O limite é global para todas as tabelas processadas pelo consumer**, e o ciclo manual lê todas as tabelas acessíveis; não existe liberação isolada por tabela ou lote.
+
+Os comandos abaixo usam a origem PostgreSQL padrão. Para SQL Server, substitua `scheduler` por `mssql-scheduler` e `cli` por `mssql-cli`, mantendo o mesmo serviço `consumer`. Não mantenha outro produtor manual em execução durante o procedimento.
+
+1. Confira a tabela, a proporção informada no erro e o conteúdo atual da origem. Confirme que a exclusão foi intencional e que a transação foi efetivada com COMMIT. No exemplo `public.lab_teste_ddl`, a consulta na origem é `SELECT count(*) FROM public.lab_teste_ddl;`.
+
+2. Pare o scheduler para concluir o ciclo atual e evitar concorrência com a leitura manual:
+
+   ```bash
+   docker compose stop scheduler
+   ```
+
+3. Em `docker-compose.yml`, localize `MAX_REMOVE_FRACTION` no ambiente do `consumer`, anote o valor anterior e ajuste apenas essa variável. Use um limite que comporte a proporção revisada; por exemplo, para remover 40%:
+
+   ```yaml
+   MAX_REMOVE_FRACTION: "0.50"
+   ```
+
+   `"1.00"` permite remover até 100% das linhas, inclusive esvaziar tabelas. Use esse valor somente quando essa possibilidade tiver sido conferida nas tabelas que serão reconciliadas. Alterar a variável apenas na CLI não modifica a validação do consumer.
+
+4. Recrie o consumer para carregar a configuração e execute uma nova reconciliação. Um simples `restart` não atualiza as variáveis de ambiente:
+
+   ```bash
+   docker compose up -d --no-deps --force-recreate consumer
+   docker compose run --rm cli discover once --promotion-timeout 600
+   docker compose run --rm cli discover status
+   ```
+
+5. Confira o resultado antes de retomar a rotina. A tabela deve estar `active`, sem erro atual e com a contagem esperada. No monitor, o novo lote deve estar `promoted`. Para o exemplo, confira também `SELECT count(*) FROM mirror_public.lab_teste_ddl;` no banco local e as linhas esperadas. O histórico e o contador de rejeições das últimas 24 horas ainda incluem o lote anterior.
+
+6. Restaure em `docker-compose.yml` o valor anotado (`"0.20"` no padrão) e recrie novamente o consumer, **mesmo se a tentativa falhar**:
+
+   ```bash
+   docker compose up -d --no-deps --force-recreate consumer
+   ```
+
+7. Após confirmar a promoção e restaurar a proteção, retome o scheduler:
+
+   ```bash
+   docker compose start scheduler
+   ```
+
+Se a reconciliação falhar, restaure o limite, mantenha o scheduler parado e consulte `docker compose logs --tail 80 consumer` e o erro do novo lote antes de tentar novamente. Não é necessário apagar volumes, zerar offsets Kafka ou editar a auditoria para liberar a exclusão.
+
+### Lotes pendentes e outros limites
+
 Um lote pendente é retomado aguardando o consumer, sem republicar bootstrap. Se uma publicação foi interrompida antes de `table_end`, examine Kafka, logs e auditoria antes de abandonar:
 
 ```bash
