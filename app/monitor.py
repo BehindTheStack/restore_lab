@@ -640,7 +640,8 @@ def table_page(rows, key, anchor, pages, label):
     controls.append(f'<span aria-current="page">Página {current} de {last}</span>')
     if current<last:
         controls.extend((link(current+1,'Próxima'),link(last,'Última')))
-    nav=(f'<nav class="pagination" aria-label="{_safe(label)}">'
+    nav=(f'<nav class="pagination" aria-label="{_safe(label)}" '
+         f'data-page-key="{_safe(key)}" data-page-target="{_safe(anchor)}" data-page-current="{current}">'
          f'<span>{start+1}–{min(start+PAGE_SIZE,total)} de {total} registros</span>'
          '<div>'+''.join(controls)+'</div></nav>')
     return rows[start:start+PAGE_SIZE],nav
