@@ -362,11 +362,134 @@ docker compose up -d --build
 
 Os schedulers terminam o ciclo atual ao receber SIGTERM, dentro do prazo de parada do Compose. `docker compose down` preserva volumes; adicionar `-v` apaga os dados do laboratório.
 
+## Tutorial: simular latência e falhas de rede
+
+O Toxiproxy já faz parte do fluxo padrão e recebe a conexão do extrator com a origem. Os comandos `chaos` alteram esse proxy sem modificar dados ou permissões do banco remoto. Execute os exemplos na pasta do projeto, com o laboratório iniciado por `docker compose up -d --build`.
+
+As simulações atingem todas as tabelas lidas pelo proxy escolhido. Nesta CLI, os efeitos são aplicados às respostas **origem → extrator** (`downstream`), com `toxicity=1.0`, abrangendo todas as conexões desse proxy. Kafka, consumer e banco local não passam por ele. Uma conexão administrativa direta ao banco também não sofre esses efeitos.
+
+### 1. Preparar uma referência sem falhas
+
+Confira o estado atual antes de alterar a simulação:
+
+```bash
+docker compose run --rm cli chaos status
+```
+
+O log `proxy_status` contém `state.enabled` e `state.toxics`. Para iniciar uma comparação sem falhas simuladas, remova as condições existentes e confira novamente:
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos status
+```
+
+O resultado esperado é `enabled: true` e `toxics: []`. Aguarde um ciclo e anote no monitor a duração e o resultado das execuções de cada tabela. Compare sempre a mesma tabela, com volume semelhante.
+
+### 2. Adicionar latência com variação
+
+```bash
+docker compose run --rm cli chaos latency 200
+docker compose run --rm cli chaos status
+```
+
+O valor é em milissegundos. A CLI calcula `jitter` como um quinto inteiro da latência: `200` configura `latency=200` e `jitter=40`, variando o atraso entre 160 e 240 ms no fluxo de resposta. Esse atraso pode incidir várias vezes durante a comunicação; não significa que a duração total do lote aumentará apenas 200 ms.
+
+Para aumentar a condição no mesmo teste:
+
+```bash
+docker compose run --rm cli chaos latency 500
+```
+
+Isso substitui a condição chamada `latency`, agora com `jitter=100`. Outros tipos de condição já ativos continuam valendo. O jitter não tem parâmetro independente nesta CLI.
+
+Observe a duração dos lotes e a idade da última promoção. A leitura completa, as consultas de catálogo e as buscas em blocos podem amplificar o efeito. Mesmo com zero alterações, a tabela continua sendo lida e as presenças de suas chaves são enviadas ao Kafka.
+
+### 3. Limitar a banda
+
+Para testar a limitação isoladamente, remova a latência do cenário anterior:
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos bandwidth 256
+```
+
+`256` limita a resposta a 256 KB/s **por conexão**, não a soma do tráfego de todos os serviços. Tabelas com mais dados devem apresentar maior impacto. A guarda de exclusão e as demais validações continuam funcionando normalmente.
+
+### 4. Combinar latência e banda reduzida
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos latency 100
+docker compose run --rm cli chaos bandwidth 128
+docker compose run --rm cli chaos status
+```
+
+As duas condições ficam ativas ao mesmo tempo. O `status` deve listar `latency` e `bandwidth` em `toxics`. A CLI mantém uma condição de cada nome; repetir `bandwidth` troca sua configuração, sem remover `latency`.
+
+### 5. Simular uma conexão sem resposta e com fechamento
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos timeout 3000
+```
+
+O toxic `timeout` bloqueia o fluxo afetado e fecha a conexão após 3000 ms. Ele não concede três segundos para uma consulta concluir. Com valor `0`, o bloqueio não fecha a conexão por esse mecanismo e pode deixar uma leitura esperando até outro timeout ou a remoção da condição. Prefira um valor positivo neste primeiro teste.
+
+O erro pode acontecer durante a descoberta do catálogo, antes de existir um lote da tabela. Nesse caso, confira também o último ciclo e os logs do scheduler; não espere obrigatoriamente uma nova linha em **Últimas execuções**.
+
+### 6. Simular indisponibilidade e retorno da conexão
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos down
+docker compose run --rm cli chaos status
+```
+
+`down` desabilita o proxy da origem. Aguarde uma tentativa do scheduler para observar a falha de acesso. Para reativá-lo:
+
+```bash
+docker compose run --rm cli chaos up
+```
+
+**`up` reativa o proxy e mantém os toxics existentes. `clear` remove todos os toxics desse proxy e também o reativa.** Nenhuma dessas ações altera a disponibilidade do processo do banco remoto.
+
+Para testar intermitência, repita manualmente a sequência `down`/`up`, aguardando tentativas de leitura entre as mudanças. A CLI atual não agenda quedas, não define duração automática dos efeitos e não oferece um comando próprio de perda aleatória de pacotes.
+
+### 7. Encerrar o teste e conferir a recuperação
+
+Ao terminar qualquer cenário, inclusive quando ocorrer erro, execute:
+
+```bash
+docker compose run --rm cli chaos clear
+docker compose run --rm cli chaos status
+docker compose logs --tail 80 scheduler consumer
+```
+
+Confirme `enabled: true`, `toxics: []` e uma nova promoção no próximo ciclo. Os efeitos não expiram sozinhos: a inicialização normal do extrator preserva a configuração de um proxy já existente. O Compose atual não persiste essa configuração em volume; após reiniciar ou recriar o Toxiproxy, confira novamente o estado em vez de presumir que o cenário foi mantido.
+
+O scheduler padrão espera 60 segundos **após terminar o ciclo anterior**, e o painel atualiza a cada 20 segundos. Uma pausa entre execuções não equivale à duração do lote. Os tempos exibidos incluem leitura, transporte e processamento no destino; o painel atual não separa a duração de cada etapa. Kafka com lag zero também não comprova uma leitura recente: o produtor pode estar bloqueado antes de publicar mensagens.
+
+Uma leitura incompleta não autoriza exclusões ou promoção parcial dessa tabela; sua publicação anterior é preservada. Tabelas já promovidas no mesmo ciclo permanecem publicadas, pois a unidade de publicação é cada tabela. Se um lote ficar pendente após uma interrupção, siga [Lotes pendentes e outros limites](#lotes-pendentes-e-outros-limites) antes de abandoná-lo. As falhas anteriores continuam no histórico e no contador das últimas 24 horas após a recuperação.
+
+### Usar os mesmos cenários com SQL Server
+
+Com a [origem SQL Server preparada](#tutorial-sql-server), use `mssql-cli` e informe explicitamente `--target sqlserver`. Isso escolhe o proxy `remote_mssql`; o padrão sem esse argumento é `remote_pg`:
+
+```bash
+docker compose run --rm mssql-cli chaos status --target sqlserver
+docker compose run --rm mssql-cli chaos latency 200 --target sqlserver
+docker compose run --rm mssql-cli chaos clear --target sqlserver
+```
+
+As ações `bandwidth`, `timeout`, `down` e `up` usam o mesmo argumento. Acompanhe `mssql-scheduler` nos logs se essa for a origem agendada. Use somente o scheduler da origem escolhida, conforme a configuração do laboratório.
+
+As unidades e o comportamento dos toxics seguem a [documentação oficial do Toxiproxy](https://github.com/Shopify/toxiproxy/blob/v2.13.0/README.md#toxics). Os comandos, nomes, direção e regras de combinação acima correspondem à CLI implementada neste repositório.
+
 ## Compatibilidade com os comandos anteriores
 
 `initialize`, `bootstrap`, `incremental`, `schedule`, `status`, `rollback`, `schema` e `catalog` continuam disponíveis para o contrato fixo `public.contracts`. Esse fluxo usa faixas numéricas de ID e seus próprios metadados; não é o scheduler padrão. Para executá-lo manualmente, pare o scheduler de descoberta e use explicitamente os comandos antigos. Não misture os dois fluxos como se tivessem o mesmo checkpoint ou a mesma view.
 
-Os comandos `chaos` continuam disponíveis para o proxy. Exemplo PostgreSQL: `docker compose run --rm cli chaos down`, seguido de `chaos up`. As ações `seed`, `mutate`, `load` e os comandos da fixture SQL Server modificam dados sintéticos com credenciais administrativas; não são mecanismos de sincronização nem devem apontar para uma origem real.
+Os comandos `chaos` também atendem o fluxo legado; veja o [tutorial de simulação de rede](#tutorial-simular-latência-e-falhas-de-rede). As ações `seed`, `mutate`, `load` e os comandos da fixture SQL Server modificam dados sintéticos com credenciais administrativas; não são mecanismos de sincronização nem devem apontar para uma origem real.
 
 ## Verificações
 
