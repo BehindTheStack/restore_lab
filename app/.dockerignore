@@ -1,0 +1,14 @@
+# O contexto do build é ./app, não a raiz do repositório.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+*.log
+.git/
