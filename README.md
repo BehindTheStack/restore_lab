@@ -39,6 +39,7 @@ Variáveis já exportadas no shell têm prioridade sobre `.env`. O arquivo confi
 | Administração das fixtures | `REMOTE_ADMIN_PASSWORD`, `LOCAL_ADMIN_PASSWORD`, `MONITOR_ADMIN_PASSWORD`, `MSSQL_SA_PASSWORD`. |
 | Descoberta e proteção | `SOURCE_SCHEMAS`, `MAX_REMOVE_FRACTION`, `SCHEDULER_INTERVAL_SECONDS`, `INIT_PROMOTION_TIMEOUT_SECONDS`. |
 | Kafka e proxy | `KAFKA_BOOTSTRAP`, `KAFKA_TOPIC`, `KAFKA_AUDIT_TOPIC`, `TOXIPROXY_URL`. |
+| Retenção e manutenção | `LOG_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`, `KAFKA_RETENTION_DAYS`, `LOG_CLEANUP_ENABLED`, `LOG_CLEANUP_INTERVAL_HOURS`, `DOCKER_LOG_MAX_SIZE`, `DOCKER_LOG_MAX_FILES`. |
 | Origem SQL Server | `MSSQL_HOST`, `MSSQL_PORT`, `MSSQL_USER`, `MSSQL_PASSWORD`, `MSSQL_DATABASE`. |
 | Painel e coletor | Variáveis `LAB_*` descritas em [Monitor: como interpretar](#monitor-como-interpretar). |
 
@@ -282,9 +283,9 @@ docker compose logs --tail 80 monitor-collector monitor
 curl --fail http://localhost:8082/readyz
 ```
 
-A primeira coleta recompõe o histórico disponível na auditoria local, incluindo evidências fora das 40 execuções exibidas na página. Não é necessário apagar volumes nem refazer bootstrap. O monitor pode exibir aviso de coleta pendente durante essa preparação. Para executar o processo HTTP fora do Compose, `MONITOR_DSN` seleciona o banco separado; o modo de leitura direta com `LOCAL_DSN` permanece disponível para compatibilidade.
+A primeira coleta recompõe o histórico dentro de `AUDIT_RETENTION_DAYS` e todas as execuções pendentes, incluindo evidências fora das 40 execuções exibidas na página. Não é necessário apagar volumes nem refazer bootstrap. O monitor pode exibir aviso de coleta pendente durante essa preparação. Para executar o processo HTTP fora do Compose, `MONITOR_DSN` seleciona o banco separado; o modo de leitura direta com `LOCAL_DSN` permanece disponível para compatibilidade.
 
-Nesta implementação, cada coleta percorre os metadados históricos para também capturar conclusões tardias e alterações de estado, com memória limitada e gravação apenas dos documentos divergentes. O custo cresce com o histórico, e não há retenção automática. Os limites de janela e de lotes travados devem ser configurados no **coletor**, que calcula esses indicadores; mantenha os mesmos valores no painel para os rótulos e alertas.
+Cada coleta percorre os metadados da janela de auditoria e as execuções pendentes para capturar conclusões tardias e alterações de estado, com memória limitada e gravação apenas dos documentos divergentes. Os detalhes expirados da projeção são removidos periodicamente e não são recopiados. Os limites de janela e de lotes travados devem ser configurados no **coletor**, que calcula esses indicadores; mantenha os mesmos valores no painel para os rótulos e alertas. Veja [Retenção de logs e auditoria](#retenção-de-logs-e-auditoria) para as exceções de recuperação e o resultado da manutenção.
 
 Parâmetros do serviço `monitor`:
 
@@ -328,6 +329,7 @@ Parâmetros exclusivos de `monitor-collector`: `LOCAL_DSN` é a conexão SELECT 
 | `.env.example` | Modelo versionado da configuração local do Compose. |
 | `app/.dockerignore` | Exclusões do contexto de build `./app`. |
 | `app/lab.py` | CLI, transporte Kafka, consumer e integração com o fluxo legado. |
+| `app/retention.py` | Configuração central, manutenção limitada, histórico da limpeza e expiração de eventos Kafka confirmados. |
 | `app/discovery_catalog.py` | Catálogos PostgreSQL/SQL Server, permissões observáveis, identificadores, mapeamento de tipos e leitura consistente. |
 | `app/discovery_sync.py` | Orquestra descoberta, comparação, publicação, espera da promoção e scheduler. |
 | `app/discovery_store.py` | Schema local automático, staging por tabela, views tipadas, slots, journal, promoção, retirada e rollback. |
@@ -568,6 +570,100 @@ As unidades e o comportamento dos toxics seguem a [documentação oficial do Tox
 
 Os comandos `chaos` também atendem o fluxo legado; veja o [tutorial de simulação de rede](#tutorial-simular-latência-e-falhas-de-rede). As ações `seed`, `mutate`, `load` e os comandos da fixture SQL Server modificam dados sintéticos com credenciais administrativas; não são mecanismos de sincronização nem devem apontar para uma origem real.
 
+## Retenção de logs e auditoria
+
+### Diagnóstico anterior à alteração
+
+A auditoria examinou `docker-compose.yml`, `app/lab.py`, `discovery_store.py`, `schema_evolution.py`, `source_catalog.py`, o coletor/painel, os três scripts SQL e as configurações efetivas do laboratório em 22/10/2026:
+
+- **Kafka:** dados em `kafka_data`, diretório `/var/lib/kafka/data`. `kafka_ready()` criava os dois tópicos com `cleanup.policy=delete` e `retention.ms=604800000` fixos (sete dias), mas ignorava `TOPIC_ALREADY_EXISTS` sem alterar configurações existentes. Os tópicos reais `lab.sync.events` e `lab.sync.audit` tinham esses valores. Não havia variável de retenção nem proteção dos eventos não confirmados contra expiração por idade. `__consumer_offsets` usava compactação; não é um log operacional a apagar.
+- **PostgreSQL local:** `local_data` guarda tanto o histórico quanto o estado essencial em `replica`. `sync_runs`, `transitions`, `schema_changes`, `source_catalog_observations`, `range_checkpoints` e tabelas `discovered_*` não tinham expiração temporal. Staging era removido por conclusão/aborto; `change_journal` já tinha poda estrutural pelo caminho entre os slots (`prune_journal()`), sem prazo em dias. O journal da descoberta e as gerações eram mantidos sem expiração. Variáveis de janela do monitor apenas limitavam consultas, sem remover registros.
+- **Docker:** Python grava JSON/exceções em stdout/stderr; os PostgreSQL inspecionados usam `logging_collector=off`, `log_destination=stderr`. A saída de consumer, scheduler, init, monitor, coletor, Kafka e Toxiproxy fica com o driver de logs do Docker. O Compose não declarava limites. Neste host, os contêineres usavam `local` com opções vazias: a rotação vinha dos padrões do driver, não de uma política do projeto. Em outro daemon, o comportamento poderia ser diferente. Não havia garantia temporal de sete dias.
+- **Arquivos internos Kafka:** a inspeção da imagem em execução também encontrou `/opt/kafka/logs/server.log`, `controller.log`, `state-change.log` e outros appenders Log4j2 com rotação horária, sem descarte configurado, na camada gravável do contêiner (fora de `kafka_data`). O script Java usava ainda GC em arquivos, com limite próprio de 10 × 100 MB. A rotação Docker não alcançava essas cópias internas. `config/kafka-log4j2.yaml` e `KAFKA_GC_LOG_OPTS` agora direcionam esses diagnósticos ao stdout; a recriação do contêiner elimina sua camada antiga, preservando o volume de eventos.
+- **Monitor:** o HTTP em 8082 lê `monitor_data` (`monitoring.collection_state` e `monitoring.details`) e metadados Kafka. O coletor lê apenas a auditoria local e copiava todos os detalhes de execução indefinidamente; as 40 execuções do painel não eram uma política de armazenamento. A projeção não contém linhas de negócio nem checkpoints de restauração.
+
+### Configuração e aplicação automática
+
+Arquivos desta implementação: `app/retention.py`, integração em `app/lab.py`/`app/Dockerfile`, projeção em `app/monitor_collect.py`, apresentação em `app/monitor.py`, configuração em `docker-compose.yml`/`.env.example`/`config/kafka-log4j2.yaml` e este README. Os testes novos são `tests/test_retention.py`, `tests/test_retention_live.py`, `tests/test_retention_kafka_live.py`, `tests/test_retention_monitor_live.py` e `tests/e2e_retention.sh`. Foram ajustados também `tests/check_static.py`, `tests/test_monitor.py`, `tests/test_monitor_storage.py` e `tests/test_mssql_paths.py`; os dois testes que esperavam portas/usuário fixos agora refletem a interpolação já existente do Compose. A lógica de reconciliação permanece a mesma.
+
+Acrescente ou ajuste no `.env` existente (os padrões do Compose também permitem usar um `.env` antigo):
+
+```dotenv
+LOG_RETENTION_DAYS=7
+AUDIT_RETENTION_DAYS=7
+KAFKA_RETENTION_DAYS=7
+LOG_CLEANUP_ENABLED=true
+LOG_CLEANUP_INTERVAL_HOURS=24
+DOCKER_LOG_MAX_SIZE=20m
+DOCKER_LOG_MAX_FILES=5
+```
+
+Dias e intervalo aceitam inteiros positivos; o habilitador aceita `true`/`false`. `LOG_RETENTION_DAYS` controla o histórico operacional da própria manutenção armazenado no PostgreSQL. As mensagens de stdout/stderr usam os dois limites Docker, pois o driver `local` **não oferece expiração temporal exata**. Todos os serviços, inclusive os perfis SQL Server e ferramentas, compartilham essa rotação por tamanho/arquivos, com compressão padrão do driver. Os arquivos pertencem ao Docker e não devem ser apagados por scripts da aplicação.
+
+O Kafka recebe `config/kafka-log4j2.yaml` como montagem somente leitura, com apenas appender de console, e envia GC ao stdout. Isso evita cópias de diagnóstico com políticas independentes dentro do contêiner. Os diretórios de segmentos de eventos em `kafka_data` continuam sendo dados Kafka, tratados pela política específica abaixo.
+
+Depois de editar, execute `docker compose up -d --build`. O consumer cria as duas tabelas auxiliares de manutenção com DDL aditivo idempotente e aplica as configurações dos tópicos por `incremental_alter_configs`, inclusive em volumes previamente inicializados. Não depende de reexecutar `docker-entrypoint-initdb.d`, apagar volumes ou mudar código. As políticas são dos dois tópicos configurados em `KAFKA_TOPIC`/`KAFKA_AUDIT_TOPIC`, não de tópicos arbitrários do broker. `restart` sozinho não carrega novas variáveis.
+
+### Matriz de retenção e dependências
+
+| Componente / dado | Classe | Retenção padrão | Mecanismo e justificativa |
+| --- | --- | --- | --- |
+| stdout/stderr de todos os contêineres | A | Limite de 20 MB × 5 arquivos por contêiner; sem prazo temporal | Driver Docker `local`, opções explícitas e configuráveis. Volume de mensagens determina quanto tempo cabe. |
+| `replica.log_cleanup_history` | A | `LOG_RETENTION_DAYS` = 7 dias | Exclusões em lotes; registra data, duração, contagens, configurações e erros. |
+| `lab.sync.audit` | A/B | `KAFKA_RETENTION_DAYS` = 7 dias | Broker: `cleanup.policy=delete`, `retention.ms=dias×86400000`, sem limite em bytes, segmentos de até uma hora. Não participa da recuperação do consumer. |
+| `lab.sync.events` | A/C enquanto pendente | Idade mínima de `KAFKA_RETENTION_DAYS` = 7 dias para mensagens confirmadas | `retention.ms=-1`, `retention.bytes=-1` impedem expiração autônoma. A manutenção usa `DeleteRecords` até o menor offset entre a fronteira temporal e o offset confirmado pelo grupo. Suspende se houver lote/ciclo/backfill/migração pendente ou se faltar evidência do offset. |
+| `replica.transitions` | B | `AUDIT_RETENTION_DAYS` = 7 dias | Remove transições antigas, preservando a última. Slots/gerações não dependem dessa tabela; o painel usa a última como contexto operacional. |
+| `replica.source_catalog_observations` | B; última observação é referência atual | 7 dias, preservando a última por `source_key` | A comparação estrutural lê a observação de maior ID. Ela permanece mesmo antiga para não perder a referência de DDL. Cada observação contém os manifestos e diferenças. |
+| `replica.discovered_schema_history` | B; última observação é referência atual | 7 dias, preservando a última por tabela | Manifestos usados para publicação/rollback já estão em `discovered_tables`/`discovered_runs`. Histórico antigo excedente pode sair sem alterar esses contratos. |
+| `sync_runs`, `discovered_runs`, `discovered_cycles` | B + C | Sem exclusão por idade | IDs terminais também impedem reprocessamento de mensagens Kafka. O protocolo não registra fronteiras Kafka por lote que provem ser seguro remover esses marcadores. Execuções em andamento ficam intactas. |
+| Gerações, slots, estados ativos, `range_checkpoints`, journals | C | Sem exclusão por idade | FKs e referências lógicas sustentam linhagem, cobertura, rollback e alinhamento. A poda estrutural preexistente de `change_journal` continua sendo a autoridade. |
+| `schema_versions`, `schema_state`, `schema_changes`, `schema_backfill_*` | B/C | Sem exclusão por idade | Hash ativo/pendente, evidências de aprovação e intervalos têm dependências de recuperação. `schema_changes` não encerra todos os estados antigos de forma suficiente para provar descarte seguro; permanece conservadoramente integral. |
+| `ingest_*`, `discovered_delta`, `discovered_seen`, linhas blue/green, arquivos de tabelas retiradas | C | Pelo ciclo de vida existente | Somente a reconciliação pode liberar staging e dados; manutenção temporal não interfere, inclusive em falhas e cargas pendentes. |
+| `monitoring.details`, tipo `run` | B (cópia) | 7 dias após `finished_at`; pendentes preservados | Coletor filtra importação e apaga detalhes expirados em lotes. Nunca altera o registro original. Conclusões sem data também são preservadas. |
+| `monitoring.collection_state`, detalhes de catálogo atual, `log_cleanup_state` | Estado de operação atual | Último estado por chave, sem expiração | Atualização por chave; conserva último resultado, inclusive erro, sem acumular snapshots. |
+| `__consumer_offsets` | C | Política interna do Kafka, sem alteração pela manutenção | Nenhuma exclusão, alteração de configuração ou reset de offsets pelo processo de limpeza. |
+
+As FKs de `ingest_*` e `range_checkpoints` apontam para `sync_runs`; checkpoints/journal/slots apontam para `generations`, que tem referência ao pai. `generations.run_id`, `base_version` e `result_version` também são referências lógicas, mesmo sem FK. Na descoberta, gerações apontam para runs e pais; runs apontam para ciclos e tabelas; staging aponta para runs e journal aponta para gerações. Backfills têm FKs para hashes e runs. A política preserva esses conjuntos inteiros, sem exclusões em cadeia e sem inferir segurança apenas da ausência de uma FK.
+
+### Manutenção, replay e limites
+
+O consumer executa uma thread leve com conexão local própria. Ela verifica a agenda persistida a cada 30 segundos; executa na primeira oportunidade e depois a cada `LOG_CLEANUP_INTERVAL_HOURS`. Reinícios não zeram a agenda. Falhas registradas são tentadas novamente após um minuto. Uma trava consultiva impede limpezas simultâneas. O coletor usa a mesma configuração de intervalo para sua projeção, com resultado persistido no snapshot. Não foi adicionado serviço nem banco.
+
+Cada tabela tem até 20 lotes de 500 linhas por execução, com transações curtas, `FOR UPDATE SKIP LOCKED`, `lock_timeout=1s` e `statement_timeout=5s`. Um acúmulo maior precisa de novas execuções; `dry-run` conta todos os elegíveis (também limitado pelo timeout), podendo superar o número removido em uma passagem. Registros travados ficam para outra tentativa. Erros por componente não autorizam apagar estado nem cancelar a replicação. O processo não usa `TRUNCATE`, `DROP` ou `CASCADE`. O espaço liberado pode ser reutilizado pelo PostgreSQL após autovacuum; não há `VACUUM FULL` nem promessa de redução imediata dos arquivos.
+
+No tópico de dados, timestamps novos são do broker (`LogAppendTime`). Mensagens recentes e offsets não confirmados permanecem; enquanto houver qualquer carga pendente, a expiração dos eventos é suspensa. Isso pode aumentar o uso de disco além de sete dias, inclusive com o consumer parado. Resolver/abandonar cargas continua sendo uma decisão operacional pelos comandos existentes. `LOG_CLEANUP_ENABLED=false` desliga a limpeza automática SQL e de eventos; a retenção independente do tópico de auditoria e a rotação Docker continuam. Uma execução manual explícita continua disponível.
+
+Kafka expira segmentos e `DeleteRecords` avança o início lógico do log; a remoção física é assíncrona. Portanto, o prazo é uma janela de elegibilidade, acrescida do intervalo de manutenção e da liberação de segmentos, não uma exclusão pontual no sétimo dia. **Retenção Kafka não substitui backup.** Depois de expirar eventos, resetar offsets ou tentar reconstruir um PostgreSQL vazio pode exigir novo bootstrap da origem; não se promete reconstrução integral a partir de um trecho retido. Os marcadores locais de replay são conservadoramente preservados.
+
+### Inspeção, dry-run e resultado
+
+```bash
+# Configuração validada; consulta mostra apenas parâmetros de retenção e resultados.
+docker compose config --quiet
+docker compose run --rm cli cleanup --status
+
+# Conta elegíveis, sem apagar histórico ou mensagens; registra a simulação separadamente.
+docker compose run --rm cli cleanup --dry-run
+docker compose run --rm cli cleanup
+docker compose logs --tail 80 consumer monitor-collector
+
+# Configuração efetiva dos tópicos, inclusive dos volumes antigos.
+docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:19092 --entity-type topics --describe
+
+# Últimos resultados locais (automatic, manual e dry_run).
+docker compose exec -T local-db psql -U postgres -d lab_local -c 'SELECT job,document FROM replica.log_cleanup_state ORDER BY job'
+```
+
+O `dry-run` grava apenas seu resultado nas tabelas de controle, sem adiar a agenda automática. A expiração Kafka mostra **offsets**, que não equivalem a linhas de negócio nem a bytes físicos. Para simular separadamente a projeção do monitor, sem fornecer novas credenciais à CLI:
+
+```bash
+docker compose run --rm --no-deps --entrypoint python monitor-collector -c 'import os,json,psycopg,retention,monitor_collect as c; from datetime import datetime,timezone; conn=psycopg.connect(os.environ["MONITOR_WRITE_DSN"]); print(json.dumps(c.cleanup_projection(conn,os.getenv("LAB_SYNC_MODE","catalog"),datetime.now(timezone.utc),retention.Settings.from_env(),True))); conn.close()'
+```
+
+Em [localhost:8082/#maintenance](http://localhost:8082/#maintenance) e `/status.json`, o coletor publica períodos configurados, resultados automáticos/manuais/simulações, duração, contagens por tabela, fronteira Kafka e erros. Falhas geram `LOG_CLEANUP_FAILED`/`MONITOR_CLEANUP_FAILED`; uma execução automática atrasada gera `LOG_CLEANUP_OVERDUE`. A exibição usa a coleta existente e conserva sua indicação de atualização.
+
+Referências dos mecanismos: [retenção de tópicos Kafka](https://kafka.apache.org/39/configuration/topic-level-configs/), [API administrativa Kafka Python](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html) e [driver de logs local do Docker](https://docs.docker.com/engine/logging/drivers/local/). As APIs e configurações também foram verificadas nas imagens usadas pelo laboratório.
+
 ## Verificações
 
 Testes offline, sem bancos ou Kafka:
@@ -585,6 +681,7 @@ python3 tests/test_schema_contract.py
 python3 tests/test_source_catalog.py
 python3 tests/test_mssql_contract.py
 python3 tests/test_mssql_paths.py
+python3 tests/test_retention.py  # requer as dependências de app/requirements.txt
 ```
 
 Integração dos dois motores em projetos descartáveis, sem publicar portas do host:
@@ -594,9 +691,18 @@ LAB_DISCOVERY_TEST=1 bash tests/e2e_discovery.sh
 # Ou apenas um motor:
 LAB_DISCOVERY_TEST=1 LAB_DISCOVERY_ENGINE=postgresql bash tests/e2e_discovery.sh
 LAB_DISCOVERY_TEST=1 LAB_DISCOVERY_ENGINE=sqlserver bash tests/e2e_discovery.sh
+
+# Retenção real em stack própria, também sem portas publicadas:
+LAB_RETENTION_TEST=1 bash tests/e2e_retention.sh
 ```
 
 O teste valida início padrão, recusa de escrita pela conta SELECT, descoberta, INSERT/UPDATE/DELETE, rollback compatível, guarda de exclusão, ADD/ALTER COLUMN, bloqueio de rollback incompatível, PK composta, tabela sem PK, DROP seguro, evidências HTTP e paginação. O teste SQL Server desabilita SNAPSHOT na fixture para exercitar o fallback SERIALIZABLE sem permissão administrativa no produtor. Os recursos e volumes criados pelo teste são removidos ao terminar.
+
+O teste de retenção usa `test_retention_live.py`, `test_retention_kafka_live.py` e `test_retention_monitor_live.py`: verifica sete dias, alteração para trinta dias no PostgreSQL e quatorze no tópico existente, registros recentes/últimos preservados, antigos elegíveis removidos, pendências e migrações preservadas, checkpoints/gerações/journals intactos, agenda persistida após recriações, `dry-run`, idempotência, consumer após `DeleteRecords`, ausência de recópia de detalhes expirados e bootstrap/incremental/rollback/DDL depois da manutenção. Aguarda estabilização do grupo entre recriações para não confundir rebalanceamento com falha de promoção. As fixtures SQL locais do primeiro módulo são desfeitas por rollback; os tópicos e grupos sintéticos são exclusivos da stack descartável.
+
+Validação executada em **22/10/2026**: verificações offline listadas acima aprovadas, incluindo cinco testes unitários de retenção (com contagem preservada após falha parcial e sem contar uma transação que falhou no commit); `e2e_retention.sh` aprovado com PostgreSQL/Kafka reais; `e2e_discovery.sh` aprovado para **PostgreSQL e SQL Server**. A primeira tentativa da integração de retenção excedeu o timeout durante rebalanceamentos após duas recriações; o teste passou ao aguardar o grupo estável, sem mudar a reconciliação. O Compose foi aplicado ao laboratório, com `init` finalizado, painel `operational`, lag zero, driver `local` efetivamente em `20m`/`5` e sem novos arquivos em `/opt/kafka/logs` após configurar stdout. O `dry-run` no laboratório retornou zero elegíveis e nenhum erro; a remoção efetiva de dados antigos foi comprovada nas fixtures isoladas.
+
+Não foram aguardados sete dias de relógio: os testes usam datas SQL e mensagens sintéticas antigas em tópico exclusivo para verificar o corte temporal. Não foram medidos liberação física de disco após sete dias, carga de produção ou enormes acúmulos históricos. Os experimentos legados `e2e_schema.sh`/`e2e.sh` e o teste visual Playwright não foram repetidos nesta alteração; a integração atual, os testes offline de linhagem/DDL e as fixtures de estados pendentes cobrem os caminhos exercitados, sem equivaler a uma nova homologação desses experimentos.
 
 Para conferir promoção idempotente, limpeza de lotes abortados e distinção entre SELECT negado e catálogo ausente no armazenamento local, execute `docker compose exec -T -e LAB_DISCOVERY_STORE_TEST=1 consumer python - < tests/test_discovery_store_live.py`. Esse teste cria objetos dentro de uma transação e desfaz tudo com ROLLBACK; não acessa a origem.
 
