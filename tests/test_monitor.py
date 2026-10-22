@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+from html.parser import HTMLParser
 import sys
 import types
 from unittest.mock import patch
@@ -126,6 +127,51 @@ def test_database_read_failure_is_distinct_from_connection_failure():
     assert 'LOCAL_DB_DOWN' in codes and 'LOCAL_DB_READ_ERROR' not in codes
 
 
+def test_explanations_have_unique_accessible_targets_and_preserve_navigation():
+    snap=m.load_snapshot(connect=lambda *a,**kw: DB(),
+                         kafka_probe=lambda:{'ok':True,'audit_topic':True,'group':{}})
+
+    class HelpParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack=[]
+            self.ids=set()
+            self.tooltips=set()
+            self.descriptions=[]
+            self.stage_links=[]
+
+        def handle_starttag(self,tag,attrs):
+            attrs=dict(attrs)
+            if 'id' in attrs:
+                assert attrs['id'] not in self.ids, attrs['id']
+                self.ids.add(attrs['id'])
+            if attrs.get('role')=='tooltip':
+                self.tooltips.add(attrs['id'])
+            if tag=='button':
+                assert 'a' not in self.stack, 'Help buttons must not be nested inside navigation links'
+                assert attrs.get('type')=='button'
+                assert attrs.get('aria-label')
+                self.descriptions.append(attrs['aria-describedby'])
+            if tag=='a' and attrs.get('class')=='stage-link':
+                self.stage_links.append(attrs['href'][1:])
+            if tag not in ('meta','br','hr','link','input','img'):
+                self.stack.append(tag)
+
+        def handle_endtag(self,tag):
+            assert self.stack.pop()==tag, tag
+
+    parser=HelpParser()
+    parser.feed(m.render_html(snap))
+    assert parser.descriptions and set(parser.descriptions)==parser.tooltips
+    assert len(parser.descriptions)==len(parser.tooltips)
+    assert len(parser.stage_links)==8 and set(parser.stage_links)<=parser.ids
+    assert not parser.stack
+    with patch.dict(m.HELP,{'example':('Nome <teste>','Explicação <script>alert(1)</script>')}):
+        markup=m._help('example')
+    assert '<script>' not in markup and '&lt;script&gt;' in markup
+    assert 'Nome &lt;teste&gt;' in markup
+
+
 def test_permissions_and_protocol():
     src=(root/'app/monitor.py').read_text()
     assert 'REMOTE_DSN' not in src and 'docker.sock' not in src
@@ -138,9 +184,37 @@ def test_permissions_and_protocol():
     assert 'sweep_target_max_id' in (root/'app/mssql_sync.py').read_text()
     assert 'CREATE TABLE replica.range_checkpoints' in (root/'sql/local.sql').read_text()
 
+
+def test_pagination_is_bounded_and_preserves_other_tables():
+    pages=m.page_numbers({'tables_page':['2'],'runs_page':['3'],'schema_page':['<script>'],
+                          'ranges_page':['999999999999999999999999']})
+    assert pages=={'tables_page':2,'runs_page':3,'schema_page':1,'ranges_page':1}
+    rows,nav=m.table_page(list(range(23)),'tables_page','tables',pages,'Tabelas')
+    assert rows==list(range(10,20))
+    assert '11–20 de 23 registros' in nav and 'Página 2 de 3' in nav
+    assert 'runs_page=3&amp;tables_page=3#tables' in nav or 'tables_page=3&amp;runs_page=3#tables' in nav
+    rows,nav=m.table_page(list(range(23)),'tables_page','tables',{'tables_page':999},'Tabelas')
+    assert rows==[20,21,22] and 'Próxima' not in nav
+    assert m.table_page([],'tables_page','tables',{},'Tabelas')==([], '')
+    rows,nav=m.table_page([1],'tables_page','tables',{},'Tabelas')
+    assert rows==[1] and 'Página 1 de 1' in nav
+    assert m.page_numbers({'runs_page':['-1']})['runs_page']==1
+    snap=m.load_snapshot(now=datetime(2026,10,21,20,tzinfo=timezone.utc),
+        connect=lambda *a,**kw:DB(),kafka_probe=lambda:{'ok':True,'audit_topic':True,'group':{'lag':0,'members':1}})
+    snap['mode']='catalog'
+    snap['tables']=[{'engine':'postgresql','schema':'public','table':f'only_row_{n:02}',
+                     'destination_schema':'mirror_public','destination_table':f'dst_{n}',
+                     'status':'active','rows':1,'generation':1,'slot':'blue','schema_hash':'hash',
+                     'checked_at':'2026-10-21','error':None} for n in range(23)]
+    markup=m.render_html(snap,{'tables_page':2})
+    assert 'only_row_09' not in markup and 'only_row_10' in markup and 'only_row_19' in markup
+    assert 'only_row_20' not in markup and '11–20 de 23 registros' in markup
+
 if __name__=='__main__':
     for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,
                  test_database_read_failure_is_distinct_from_connection_failure,
+                 test_explanations_have_unique_accessible_targets_and_preserve_navigation,
+                 test_pagination_is_bounded_and_preserves_other_tables,
                  test_permissions_and_protocol):
         test()
     print('PASS full health: coverage, alerts, readonly, SQL, UI')

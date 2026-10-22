@@ -11,7 +11,7 @@ import os
 import statistics
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import UUID
 
 import psycopg
@@ -29,6 +29,7 @@ COVERAGE_HOURS = int(os.getenv('LAB_COVERAGE_WINDOW_HOURS', '24'))
 EXPECTED_INTERVAL_MIN = int(os.getenv('LAB_EXPECTED_INTERVAL_MINUTES', '0'))
 MAX_LAG = int(os.getenv('LAB_MAX_CONSUMER_LAG', '1000'))
 MAX_RANGES = int(os.getenv('LAB_MAX_COVERAGE_INTERVALS', '20000'))
+SYNC_MODE = os.getenv('LAB_SYNC_MODE','legacy')
 
 
 def _iso(v):
@@ -129,7 +130,96 @@ def probe_kafka(*, admin_factory=AdminClient):
     return result
 
 
+def _query_catalog_db(conn, now):
+    out={'mode':'catalog','tables':[],'active':None,'schema':None,'catalog':[],
+         'last_ranges':[],'recent_runs':[],'latest_run':None,'metrics':{},
+         'coverage':{'status':'unknown','unit':'tables','ratio':None,'gaps':[]},'table_error_count':0}
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('replica.discovered_tables')")
+        if cur.fetchone()[0] is None:
+            return out
+        cur.execute('''SELECT table_key,engine,source_schema,source_table,destination_schema,destination_table,
+            status,active_slot,active_generation,blue_generation,green_generation,row_count,schema_hash,
+            checked_at,last_error,EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=t.destination_schema AND c.relname=t.destination_table AND c.relkind='v'
+                AND obj_description(c.oid,'pg_class')='kafka-restore-lab:discovery:'||t.table_key)
+            FROM replica.discovered_tables t ORDER BY engine,source_schema,source_table''')
+        keys=('key','engine','schema','table','destination_schema','destination_table','status','slot',
+              'generation','blue_generation','green_generation','rows','schema_hash','checked_at','error','published')
+        tables=[dict(zip(keys,row)) for row in cur.fetchall()]
+        for table in tables:
+            table['checked_at']=_iso(table['checked_at'])
+        out['tables']=tables
+        published=[t for t in tables if t['generation'] is not None and t['published']]
+        if published:
+            out['active']={'version':max(t['generation'] for t in published),'slot':'por tabela',
+                           'rows':sum(t['rows'] for t in published),'published_tables':len(published),
+                           'blue_tables':sum(t['slot']=='blue' for t in published),
+                           'green_tables':sum(t['slot']=='green' for t in published)}
+        out['table_error_count']=sum(t['status'] in ('error','blocked','inaccessible') for t in tables)
+        cur.execute('''SELECT r.run_id::text,t.engine,t.source_schema,t.source_table,r.mode,r.status,
+            r.delta_count,r.seen_count,r.inserted_count,r.updated_count,r.deleted_count,
+            r.logical_bytes,r.started_at,r.finished_at,r.error,r.result_generation,t.active_slot
+            FROM replica.discovered_runs r JOIN replica.discovered_tables t USING(table_key)
+            ORDER BY r.started_at DESC LIMIT 40''')
+        for rid,engine,schema,table,mode,status,delta,seen,ins,upd,deleted,nbytes,start,end,error,generation,slot in cur.fetchall():
+            run={'id':rid,'engine':engine,'object':schema+'.'+table,'mode':mode,'status':status,
+                 'low':None,'high':None,'delta':delta,'seen':seen,'inserted':ins,'updated':upd,
+                 'deleted':deleted,'bytes':nbytes,'started_at':_iso(start),'finished_at':_iso(end),
+                 'duration_seconds':round((end-start).total_seconds(),2) if end else None,
+                 'age_seconds':_age(start,now),'error':error,'generation':generation,'slot':slot}
+            out['recent_runs'].append(run)
+        if out['recent_runs']:
+            out['latest_run']=out['recent_runs'][0]
+        promoted=next((r for r in out['recent_runs'] if r['status']=='promoted'),None)
+        if promoted:
+            out['last_transition']={'action':'promote','to':promoted['slot'],'version':promoted['generation'],
+                                    'at':promoted['finished_at']}
+        cur.execute('''SELECT count(*) FILTER(WHERE status='loading'),
+            count(*) FILTER(WHERE status='loading' AND started_at < %s-make_interval(mins=>%s)),
+            count(*) FILTER(WHERE status IN ('failed','rejected','aborted') AND finished_at >= %s-interval '24 hours'),
+            count(*) FILTER(WHERE status='rejected' AND finished_at >= %s-interval '24 hours'),
+            count(*) FILTER(WHERE status='promoted' AND finished_at >= %s-interval '24 hours'),
+            COALESCE(sum(inserted_count) FILTER(WHERE status='promoted' AND finished_at >= %s-interval '24 hours'),0),
+            COALESCE(sum(updated_count) FILTER(WHERE status='promoted' AND finished_at >= %s-interval '24 hours'),0),
+            COALESCE(sum(deleted_count) FILTER(WHERE status='promoted' AND finished_at >= %s-interval '24 hours'),0),
+            COALESCE(sum(logical_bytes) FILTER(WHERE status='promoted' AND finished_at >= %s-interval '24 hours'),0),
+            max(finished_at) FILTER(WHERE status='promoted') FROM replica.discovered_runs''',
+            (now,STALLED_MIN,now,now,now,now,now,now,now))
+        row=cur.fetchone()
+        out['metrics']=dict(zip(('pending','stalled','failures_24h','rejected_24h','promotions_24h',
+                                'inserted_24h','updated_24h','deleted_24h','kafka_bytes_24h','last_success_at'),row))
+        for name in ('inserted_24h','updated_24h','deleted_24h','kafka_bytes_24h'):
+            out['metrics'][name]=int(out['metrics'][name])
+        out['metrics']['last_success_age_seconds']=_age(row[9],now)
+        out['metrics']['last_success_at']=_iso(row[9])
+        cur.execute('''SELECT status,error,started_at,finished_at FROM replica.discovered_cycles
+                       ORDER BY started_at DESC LIMIT 1''')
+        cycle=cur.fetchone()
+        if cycle:
+            out['latest_cycle']={'status':cycle[0],'error':cycle[1],
+                                 'started_at':_iso(cycle[2]),'finished_at':_iso(cycle[3])}
+        visible=[t for t in tables if t['status']!='missing_or_inaccessible']
+        checked=[t for t in visible if t['checked_at'] and
+                 datetime.fromisoformat(t['checked_at']) >= now-timedelta(hours=COVERAGE_HOURS)]
+        total=len(visible)
+        out['coverage']={'unit':'tables','status':('complete' if len(checked)==total else 'partial') if total else 'unknown',
+                         'ratio':round(100*len(checked)/total,2) if total else None,'covered_ids':len(checked),
+                         'target_max_id':total,'interval_count':out['metrics']['promotions_24h'],
+                         'window_hours':COVERAGE_HOURS,'gaps':[]}
+        cur.execute('''SELECT h.table_key,t.engine,h.classification,h.observed_at,h.schema_hash,
+            t.source_schema,t.source_table FROM replica.discovered_schema_history h
+            JOIN replica.discovered_tables t USING(table_key)
+            WHERE h.id IN(SELECT max(id) FROM replica.discovered_schema_history GROUP BY table_key)
+            ORDER BY h.observed_at DESC LIMIT 20''')
+        out['catalog']=[{'source':r[5]+'.'+r[6],'engine':r[1],'classification':r[2],
+                         'observed_at':_iso(r[3]),'native_hash':r[4],'logical_hash':r[4]} for r in cur.fetchall()]
+    return out
+
+
 def _query_db(conn, now):
+    if SYNC_MODE=='catalog':
+        return _query_catalog_db(conn,now)
     out = {}
     with conn.cursor() as cur:
         cur.execute('''SELECT a.slot,a.version,a.row_count,a.next_sweep_id,a.cutoff,
@@ -285,6 +375,12 @@ def evaluate(snapshot):
     if sc.get('pending_hash'):
         alert('warning','DDL_PENDING','Mudança estrutural em preparação bloqueia sincronização',
               'Conferir schema, aprovação e progresso do backfill.')
+    if snapshot.get('table_error_count'):
+        alert('warning','TABLE_REPLICATION_ERROR',f"{snapshot['table_error_count']} tabela(s) com erro ou acesso bloqueado",
+              'Consultar o catálogo de tabelas, conferir SELECT na origem e o erro da última leitura.')
+    if (snapshot.get('latest_cycle') or {}).get('status')=='failed':
+        alert('warning','CATALOG_CYCLE_FAILED','Última descoberta de tabelas falhou',
+              (snapshot['latest_cycle'].get('error') or 'Conferir conexão, catálogo e permissões SELECT da origem.'))
     if k.get('lag') is not None and k['lag'] > MAX_LAG:
         alert('warning','CONSUMER_LAG',f"Atraso Kafka de {k['lag']} mensagens supera {MAX_LAG}",
               'Verificar consumer, throughput e offsets no Kafbat.')
@@ -342,28 +438,228 @@ def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka)
     except Exception as exc:
         state['kafka']={'ok':False,'error':f'{type(exc).__name__}: {str(exc)[:230]}',
                         'group':{'state':'unknown','members':None,'lag':None}}
+    if state.get('mode')=='catalog':
+        state['limitations']=[
+            'Sem consulta direta à origem: conectividade atual não aferida pelo painel.',
+            'Cobertura mede tabelas com leitura completa validada na janela, não linhas ou bytes.',
+            'As tabelas usam transações independentes: 100% não garante snapshot global simultâneo.',
+            'Sem CDC, alterações intermediárias podem não ser observadas entre ciclos.',
+            'Ausência no catálogo pode significar DROP ou perda de visibilidade/permissão SELECT.'
+        ]
     state['overall'],state['alarms']=evaluate(state)
     return state
 
 
-def _stage(title, value, status, desc, link):
+HELP = {
+    'catalog-coverage': ('Cobertura de tabelas', 'Proporção das tabelas visíveis que tiveram uma leitura '
+                         'completa validada dentro da janela. Cada tabela é conferida em sua própria transação. '
+                         '100% indica leituras concluídas na janela, sem garantir igualdade simultânea de toda a origem.'),
+    'published-tables': ('Tabelas publicadas', 'Tabelas que já possuem uma geração validada e uma view no destino. '
+                         'As views ficam em mirror_<schema>, por exemplo mirror_public.contratos. '
+                         'As gerações e os slots são independentes para cada tabela.'),
+    'catalog-schema': ('Estrutura por tabela', 'O catálogo de colunas, tipos e chave primária é relido em cada ciclo. '
+                       'Uma mudança prepara uma cópia completa e só publica a nova view depois da validação. '
+                       'Tipos sem correspondência segura ficam como texto, preservando a representação original.'),
+    'checked-tables': ('Tabelas conferidas', 'Quantidade de tabelas cuja leitura completa foi validada na janela. '
+                       'Uma tabela com erro mantém a última geração válida; confira a data e o erro no catálogo.'),
+    'visible-tables': ('Tabelas visíveis', 'Tabelas encontradas dentro dos schemas selecionados. A descoberta depende '
+                       'da visibilidade e das permissões SELECT da conta remota. O middleware não concede permissões na origem.'),
+    'validated-scans': ('Leituras validadas', 'Quantidade de leituras completas promovidas na janela. Uma tabela '
+                        'pode ser conferida várias vezes. Sem chave primária, a cópia é exata, mas contagens de UPDATE e DELETE não são inferidas.'),
+    'blue-tables': ('Tabelas em BLUE', 'Quantidade de tabelas cuja geração publicada está no slot BLUE. '
+                    'Cada tabela alterna seus próprios slots; não existe uma geração global simultânea para toda a origem.'),
+    'green-tables': ('Tabelas em GREEN', 'Quantidade de tabelas cuja geração publicada está no slot GREEN. '
+                     'Os dados do slot anterior permanecem disponíveis internamente para rollback compatível.'),
+    'table-publication': ('Publicação por tabela', 'A view de cada tabela é ativada em uma transação própria. '
+                          'Uma tabela com falha não substitui a geração validada. Consulte o catálogo para ver destino, schema e erros.'),
+    'source': ('Origem remota', 'Banco PostgreSQL ou SQL Server de onde os contratos são lidos. '
+               'A conta do extrator tem acesso de leitura. “Não sondada” significa que o painel '
+               'não testa essa conexão diretamente; ele acompanha as execuções registradas.'),
+    'extractor': ('Extração', 'O Python lê a tabela ou a faixa configurada e compara resumos do conteúdo, '
+                  'chamados fingerprints. Publica os registros novos ou alterados e os IDs encontrados. '
+                  'Esses IDs permitem detectar exclusões dentro da faixa completa.'),
+    'kafka': ('Kafka', 'Serviço que armazena e entrega as mensagens do extrator ao consumer. '
+              'Os eventos de dados e de auditoria ficam em tópicos separados. “Acessível” confirma '
+              'acesso ao broker e ao tópico de dados; o processamento é acompanhado separadamente.'),
+    'consumer': ('Consumer', 'Processo que lê as mensagens do Kafka, confere cada lote e aplica as '
+                 'diferenças no destino. Só confirma a posição de leitura depois de gravar no banco. '
+                 'Durante um rebalanceamento, o grupo redistribui quem lê cada partição.'),
+    'local-db': ('PostgreSQL local', 'Banco de destino que guarda os contratos e o histórico de execução. '
+                 '“Acessível” significa que o painel conseguiu consultar a auditoria. “Erro de leitura” '
+                 'pode indicar permissão ausente ou estrutura incompatível, mesmo com o banco ligado.'),
+    'blue-green': ('Blue-green', 'Duas tabelas, BLUE e GREEN, ficam na mesma instância PostgreSQL. '
+                   'O consumer prepara a próxima geração na tabela em espera e a publica após validar. '
+                   'A aplicação lê public.contracts. O outro slot pode permitir rollback compatível.'),
+    'schema': ('DDL e schema', 'Schema é a estrutura da tabela: colunas, tipos e regras. DDL são os comandos '
+               'que alteram essa estrutura. Uma migração pendente bloqueia a sincronização normal até '
+               'a revisão, o preenchimento dos dados necessários e a ativação.'),
+    'last-promotion': ('Última promoção', 'Segundos desde que um lote validado foi publicado no destino. '
+                       'Publicar uma geração é uma promoção. Esse tempo mostra o progresso do fluxo; '
+                       'alterações da origem só aparecem quando seus IDs forem examinados novamente.'),
+    'generation': ('Versão ativa', 'Número que identifica a geração dos dados publicada no destino. '
+                   'Cada promoção cria uma geração, inclusive nas faixas sem diferenças. Um rollback '
+                   'pode voltar a uma geração anterior. O slot indica qual tabela está publicada; '
+                   'não é uma versão do aplicativo.'),
+    'lag': ('Lag Kafka', 'Mensagens que o consumer ainda não confirmou. Uma faixa sem alterações pode '
+            'gerar 1.002 mensagens: início, 1.000 presenças e fim. Picos podem ocorrer durante lotes '
+            f'e rebalanceamentos. Acima de {MAX_LAG} mensagens, o painel alerta; atraso persistente '
+            'pede verificar o consumer.'),
+    'coverage': ('Cobertura de PK', f'Parte do espaço de IDs conferida por faixas promovidas nas últimas '
+                 f'{COVERAGE_HOURS} horas, considerando a linhagem ativa. Com IDs de 1 a 10.000, 70% '
+                 'equivale a 7.000 posições conferidas. A carga inicial é feita pelo bootstrap; esta '
+                 'porcentagem acompanha a conferência periódica, sem garantir igualdade simultânea de toda a base.'),
+    'failures': ('Falhas e rejeições', 'Conta as execuções que falharam, foram abortadas ou rejeitadas '
+                 f'nas últimas 24 horas. Um lote pendente por mais de {STALLED_MIN} minutos é considerado '
+                 'travado. Consulte o erro e os logs antes de tentar outro lote.'),
+    'changes': ('Alterações promovidas', 'Soma das inserções, atualizações e exclusões dos lotes promovidos '
+                'nas últimas 24 horas. Inclui a carga inicial do bootstrap. Alterações repetidas no '
+                'mesmo contrato podem ser contadas em execuções diferentes.'),
+    'overall': ('Estado geral', 'Combina os sinais do banco local, Kafka, consumer e histórico de execução. '
+                '“Atenção” pede investigar um alerta; “Falha operacional” indica um sinal crítico. '
+                'Sem alertas, os serviços observados estão prontos, mas a igualdade de toda a origem não é certificada.'),
+    'last-reading': ('Última leitura', 'Momento em que o monitor reuniu os sinais exibidos nesta página, '
+                     'apresentado no horário de Fortaleza. É diferente do horário da última promoção '
+                     'e do instante em que um contrato foi alterado na origem.'),
+    'refresh': ('Atualização automática', 'A página consulta novamente os indicadores a cada 20 segundos. '
+                'Isso atualiza a visualização; não inicia uma extração. O scheduler executa as '
+                'varreduras no intervalo configurado separadamente.'),
+    'covered-ids': ('Espaço de IDs conferido', 'Quantidade de posições de ID cobertas pela união das faixas '
+                    'validadas na janela de cobertura. Faixas sobrepostas contam uma única vez. '
+                    'Como pode haver IDs sem registro, esse número pode diferir da quantidade de contratos.'),
+    'target-id': ('Limite superior observado', 'Maior ID considerado como meta nas faixas registradas. '
+                  'A cobertura é calculada no intervalo de 1 até esse limite. Novos IDs podem ampliar '
+                  'a meta. Sem um limite conhecido, a cobertura fica “não aferida”.'),
+    'intervals': ('Faixas válidas na janela', 'Quantidade de faixas promovidas usadas no cálculo de cobertura. '
+                  'Cada faixa é um intervalo de IDs, como 1–1.000. Lotes rejeitados e gerações fora '
+                  'da linhagem ativa não entram no cálculo; sobreposições não aumentam a área conferida.'),
+    'brokers': ('Brokers', 'Servidores Kafka encontrados pelo monitor. Um broker recebe e armazena mensagens '
+                'para os consumidores. Este laboratório usa um único broker; esse número não mede '
+                'quantidade de contratos nem disponibilidade da origem.'),
+    'partitions': ('Partições', 'Divisões de um tópico Kafka que mantêm a ordem das mensagens dentro '
+                   'de cada divisão. O tópico de dados deste laboratório usa uma partição para '
+                   'preservar a ordem dos eventos de cada lote.'),
+    'members': ('Membros do grupo', 'Consumidores registrados no grupo Kafka. Com uma partição, apenas '
+                'um deles recebe essa partição por vez. Durante um reinício ou rebalanceamento, '
+                'o grupo pode mostrar temporariamente membros adicionais ou sem trabalho atribuído.'),
+    'blue': ('BLUE', 'Geração dos dados mantida na tabela BLUE. Ela pode estar ativa ou em espera, conforme '
+             'o indicador “Ativo”. O número identifica os dados validados que esse slot contém; '
+             'um traço indica que não há informação disponível.'),
+    'green': ('GREEN', 'Geração dos dados mantida na tabela GREEN. Ela pode estar ativa ou em espera. '
+              'Nas promoções, BLUE e GREEN alternam os papéis. O slot em espera é alinhado pelo '
+              'histórico de mudanças antes de receber o próximo lote.'),
+    'active-slot': ('Slot ativo', 'Tabela que está publicada para leitura pela view public.contracts. '
+                    'O consumer troca esse estado na mesma transação que publica a geração validada. '
+                    'Um traço pode significar que o bootstrap ainda não terminou ou que a leitura falhou.'),
+    'insert': ('INSERT', 'Registros inseridos no destino por lotes promovidos nas últimas 24 horas. '
+               'A carga inicial também entra aqui: um bootstrap com 10.000 registros pode mostrar '
+               '10.000 inserções mesmo sem novas inclusões depois dele.'),
+    'update': ('UPDATE', 'Registros existentes cujo conteúdo mudou e foi atualizado no destino por '
+               'lotes promovidos nas últimas 24 horas. Uma mudança só é percebida quando sua tabela '
+               'ou faixa é examinada. Sem PK, a cópia usa snapshot e não infere a operação individual.'),
+    'delete': ('DELETE', 'Registros removidos do destino porque sua chave estava ausente na leitura completa '
+               'e validada da tabela ou faixa. Só conta exclusões promovidas nas últimas 24 horas. '
+               'Limites de segurança podem rejeitar um lote com remoções excessivas.'),
+    'rejected': ('Lotes rejeitados', 'Lotes que não passaram pelas validações nas últimas 24 horas. '
+                 'As causas incluem contagem ou hash divergente, geração base incompatível e excesso '
+                 'de exclusões. A rejeição preserva a geração publicada; veja a coluna “Erro”.'),
+    'json-bytes': ('Bytes JSON publicados', 'Volume lógico de eventos JSON contabilizado nas execuções '
+                   'promovidas nas últimas 24 horas, antes da compressão. Inclui eventos de presença. '
+                   'Não corresponde ao espaço ocupado no Kafka nem ao tráfego real de rede.'),
+}
+
+
+def _help(key, instance=None):
+    label, explanation = HELP[key]
+    tip_id = 'help-' + (instance or key)
+    return (f'<span class="help"><button class="help-button" type="button" '
+            f'aria-label="{_safe("Entenda: " + label)}" aria-describedby="{_safe(tip_id)}">'
+            '<span aria-hidden="true">?</span></button>'
+            f'<span class="help-text" id="{_safe(tip_id)}" role="tooltip">'
+            f'{_safe(explanation)}</span></span>')
+
+
+def _summary_card(title, value, desc, help_key):
+    return (f'<div class="card has-help">{_help(help_key, "summary-" + help_key)}'
+            f'<label>{_safe(title)}</label><strong>{_safe(value)}</strong>'
+            f'<small>{_safe(desc)}</small></div>')
+
+
+def _fact(title, value, help_key):
+    return (f'<div class="has-help">{_help(help_key, "fact-" + help_key)}'
+            f'<small>{_safe(title)}</small><b>{_safe(value)}</b></div>')
+
+
+def _pipeline_node(title, help_key, transport=False):
+    classes = 'pipeline-node has-help' + (' transport' if transport else '')
+    return (f'<span class="{classes}">{_safe(title)}'
+            f'{_help(help_key, "pipeline-" + help_key)}</span>')
+
+
+def _stage(title, value, status, desc, link, help_key):
     classes={'good':'good','warning':'warn','bad':'bad','unknown':'unknown'}
-    return (f'<a href="#{_safe(link)}" class="stage {classes.get(status,"unknown")}">'
+    return (f'<div class="stage has-help {classes.get(status,"unknown")}">'
+            f'{_help(help_key, "stage-" + help_key)}'
+            f'<a href="#{_safe(link)}" class="stage-link">'
             f'<span class="stage-name">{_safe(title)}</span>'
-            f'<b>{_safe(value)}</b><small>{_safe(desc)}</small></a>')
+            f'<b>{_safe(value)}</b><small>{_safe(desc)}</small></a></div>')
 
 
-def render_html(s):
+PAGE_SIZE = 10
+PAGE_KEYS = ('tables_page','runs_page','schema_page','ranges_page')
+
+
+def page_numbers(query):
+    result={}
+    for key in PAGE_KEYS:
+        raw=query.get(key,['1'])[0]
+        try:
+            result[key]=max(1,min(1000000,int(raw))) if len(raw)<=7 else 1
+        except (TypeError,ValueError):
+            result[key]=1
+    return result
+
+
+def table_page(rows, key, anchor, pages, label):
+    total=len(rows)
+    last=max(1,(total+PAGE_SIZE-1)//PAGE_SIZE)
+    current=min(pages.get(key,1),last)
+    start=(current-1)*PAGE_SIZE
+    if not total:
+        return [],''
+    def link(number,text):
+        query={k:v for k,v in pages.items() if k in PAGE_KEYS and v>1}
+        query[key]=number
+        href='/?'+urlencode(query)+'#'+anchor
+        return f'<a href="{_safe(href)}">{text}</a>'
+    controls=[]
+    if current>1:
+        controls.extend((link(1,'Primeira'),link(current-1,'Anterior')))
+    controls.append(f'<span aria-current="page">Página {current} de {last}</span>')
+    if current<last:
+        controls.extend((link(current+1,'Próxima'),link(last,'Última')))
+    nav=(f'<nav class="pagination" aria-label="{_safe(label)}">'
+         f'<span>{start+1}–{min(start+PAGE_SIZE,total)} de {total} registros</span>'
+         '<div>'+''.join(controls)+'</div></nav>')
+    return rows[start:start+PAGE_SIZE],nav
+
+
+def render_html(s, pages=None):
+    pages=page_numbers({k:[str(v)] for k,v in (pages or {}).items()})
     a=s.get('active') or {}; k=s.get('kafka') or {}; group=k.get('group') or {}
     m=s.get('metrics') or {}; c=s.get('coverage') or {}; schema=s.get('schema') or {}
     catalog=s.get('catalog') or []; runs=s.get('recent_runs') or []
     last=s.get('last_transition') or {}
+    automatic=s.get('mode')=='catalog'
+    page_runs,runs_nav=table_page(runs,'runs_page','runs',pages,'Paginação das execuções recentes')
+    page_catalog,schema_nav=table_page(catalog,'schema_page','schema',pages,'Paginação dos schemas observados')
+    page_tables,tables_nav=table_page(s.get('tables',[]),'tables_page','tables',pages,'Paginação das tabelas e réplicas')
+    page_ranges,ranges_nav=table_page(s.get('last_ranges') or [],'ranges_page','ranges',pages,'Paginação das faixas promovidas')
     checked_at=datetime.fromisoformat(s['checked_at'])
     if checked_at.tzinfo is None:
         checked_at=checked_at.replace(tzinfo=timezone.utc)
     local_reading=checked_at.astimezone(timezone(timedelta(hours=-3)))
     reading_label=local_reading.strftime('%d/%m/%Y às %H:%M:%S')
-    state_label={'operational':'Serviços prontos · integridade por faixas',
+    state_label={'operational':'Serviços prontos · leituras por tabela' if automatic else 'Serviços prontos · integridade por faixas',
                  'attention':'Atenção operacional','not_initialized':'Bootstrap pendente',
                  'unavailable':'Falha operacional'}[s['overall']]
     runtime='good' if s['local_db']['ok'] else 'bad'
@@ -377,41 +673,83 @@ def render_html(s):
     source_state='unknown' if not runs else ('warning' if runs[0]['status'] in ('failed','rejected','aborted') else 'unknown')
     cover_txt=f"{c['ratio']:.2f}%" if c.get('ratio') is not None else 'Não aferida'
     cover_state='good' if c.get('status')=='complete' else 'unknown'
-    sc_state='warning' if schema.get('pending_hash') else ('good' if schema.get('active_hash') else 'unknown')
+    sc_state=('warning' if s.get('table_error_count') else 'good') if automatic else ('warning' if schema.get('pending_hash') else ('good' if schema.get('active_hash') else 'unknown'))
     row_html=''.join(f'''<tr><td><a href="/run/{_safe(r['id'])}"><code>{_safe(r['id'][:8])}</code></a></td>
-        <td>{_safe(r['engine'])}</td><td>{_safe(r['mode'])}</td>
-        <td>{_safe(str(r['low'])+'–'+str(r['high']) if r['low'] is not None else 'bootstrap')}</td>
+        <td>{_safe((r.get('object')+' · ' if r.get('object') else '')+str(r['engine']))}</td><td>{_safe(r['mode'])}</td>
+        <td>{_safe(str(r['low'])+'–'+str(r['high']) if r['low'] is not None else 'tabela inteira' if automatic else 'bootstrap')}</td>
         <td><span class="tag">{_safe(r['status'])}</span></td>
         <td>{_safe(r['delta'])}</td><td>{_safe(r['deleted'])}</td>
         <td>{_safe(r['duration_seconds'])} s</td><td title="{_safe(r['error'])}">{_safe((r['error'] or '')[:105])}</td></tr>'''
-        for r in runs)
+        for r in page_runs)
     alert_html=''.join(f'''<div class="alert {('critical' if x['severity']=='critical' else 'warning')}">
          <b>{_safe(x['code'])}</b><span>{_safe(x['message'])}</span>
          <small>{_safe(x['action'])}</small></div>''' for x in s['alarms'])
     ranges=''.join(f'''<tr><td><a href="/run/{_safe(x['run_id'])}">{_safe(x['run_id'][:8])}</a></td>
         <td>{_safe(x['engine'])}</td><td>{_safe(x['low'])}–{_safe(x['high'])}</td>
         <td>{_safe(x['target_max_id'])}</td><td>{_safe(x['at'])}</td></tr>'''
-        for x in (s.get('last_ranges') or []))
+        for x in page_ranges)
     catalogs=''.join(f'<tr><td>{_safe(x["source"])}</td><td>{_safe(x["engine"])}</td>'
         f'<td>{_safe(x["classification"])}</td><td>{_safe(x["observed_at"])}</td></tr>'
-        for x in catalog)
+        for x in page_catalog)
     gaps=', '.join(f'{lo}–{hi}' for lo,hi in c.get('gaps',[])) or '—'
     stages=''.join([
-        _stage('Origem remota','Não sondada',source_state,'Evidência indireta das extrações','source'),
-        _stage('Extração / faixas',f"{m.get('promotions_24h',0)} promoções/24h",
+        _stage('Origem remota','Não sondada',source_state,'Evidência indireta das extrações','source','source'),
+        _stage('Extração / tabelas' if automatic else 'Extração / faixas',f"{m.get('promotions_24h',0)} promoções/24h",
                'warning' if m.get('stalled') else ('good' if a.get('version') else 'unknown'),
-               'READ ONLY · fingerprints · deletes','extract'),
+               'READ ONLY · fingerprints · deletes','extract','extractor'),
         _stage('Kafka', 'Acessível' if k.get('ok') else 'Indisponível',kafka_state,
-               f"{_safe(k.get('partitions'))} partições de dados",'kafka'),
+               f"{_safe(k.get('partitions'))} partições de dados",'kafka','kafka'),
         _stage('Consumer',f'Lag: {lag}',group_state,
-               f"{_safe(group.get('members'))} membros no grupo",'kafka'),
+               f"{_safe(group.get('members'))} membros no grupo",'kafka','consumer'),
         _stage('PostgreSQL local',db_label,runtime,
-               'Auditoria SQL persistida','destination'),
-        _stage('Blue-green',f"{_safe(a.get('slot'))} · v{_safe(a.get('version'))}",
-               'good' if a.get('version') else 'unknown','Promoção transacional','destination'),
-        _stage('DDL / schema','Pendente' if schema.get('pending_hash') else 'Sem migração pendente',sc_state,
-               'Histórico de contrato','schema'),
-        _stage('Cobertura',cover_txt,cover_state,'Faixas de PK na janela móvel','coverage')])
+               'Auditoria SQL persistida','destination','local-db'),
+        _stage('Blue-green',f"{a.get('published_tables',0)} tabelas publicadas" if automatic else f"{_safe(a.get('slot'))} · v{_safe(a.get('version'))}",
+               'good' if a.get('version') else 'unknown','Promoção transacional','destination','blue-green'),
+        _stage('DDL / schema',f"{len(s.get('tables',[]))} tabelas observadas" if automatic else 'Pendente' if schema.get('pending_hash') else 'Sem migração pendente',sc_state,
+               'Histórico de contrato','schema','catalog-schema' if automatic else 'schema'),
+        _stage('Cobertura',cover_txt,cover_state,'Tabelas conferidas na janela' if automatic else 'Faixas de PK na janela móvel',
+               'coverage','catalog-coverage' if automatic else 'coverage')])
+    age=m.get('last_success_age_seconds')
+    rows=a.get('rows')
+    summary=''.join([
+        _summary_card('Última promoção',f'{age} s' if age is not None else '— s',
+                      'Idade da promoção, não da origem','last-promotion'),
+        _summary_card('Tabelas publicadas' if automatic else 'Versão ativa',a.get('published_tables',0) if automatic else a.get('version'),
+                      f"{rows if rows is not None else '—'} linhas · publicação por tabela" if automatic else f"Slot {a.get('slot') or '—'} · {rows if rows is not None else '—'} linhas",
+                      'published-tables' if automatic else 'generation'),
+        _summary_card('Lag Kafka',group.get('lag'),'Offsets pendentes; não equivale a linhas','lag'),
+        _summary_card('Cobertura de tabelas' if automatic else 'Cobertura de PK',cover_txt,
+                      f'Janela de {COVERAGE_HOURS} h · leituras completas' if automatic else f'Janela de {COVERAGE_HOURS} h · não é cobertura de bytes',
+                      'catalog-coverage' if automatic else 'coverage'),
+        _summary_card('Falhas / rejeições (24h)',m.get('failures_24h'),
+                      f"{m.get('stalled') if m.get('stalled') is not None else '—'} lote(s) travado(s)",'failures'),
+        _summary_card('Alterações promovidas (24h)',
+                      (m.get('inserted_24h') or 0)+(m.get('updated_24h') or 0)+(m.get('deleted_24h') or 0),
+                      'INSERT + UPDATE + DELETE','changes')])
+    table_rows=''.join(f'''<tr><td>{_safe(t['engine'])} · {_safe(t['schema'])}.{_safe(t['table'])}</td>
+        <td><code>{_safe(t['destination_schema'])}.{_safe(t['destination_table'])}</code></td>
+        <td>{_safe(t['status'])}</td><td>{_safe(t['rows'])}</td><td>{_safe(t['generation'])} · {_safe(t['slot'])}</td>
+        <td><code>{_safe((t['schema_hash'] or '')[:12])}</code></td><td>{_safe(t['checked_at'])}</td>
+        <td>{_safe(t['error'])}</td></tr>''' for t in page_tables)
+    table_section=('''<section class="section" id="tables"><h2>Catálogo de tabelas e réplicas</h2>
+        <p>Descoberta por SELECT · leituras consistentes por tabela · views em mirror_&lt;schema&gt;.
+        Objetos ausentes em dois catálogos completos são despublicados; os dados internos são preservados.
+        Tabelas visíveis sem SELECT mantêm a última publicação e exibem alerta de permissão.</p>
+        <div class="data"><table><thead><tr><th>Origem</th><th>Destino</th><th>Estado</th><th>Linhas</th>
+        <th>Geração / slot</th><th>Schema</th><th>Conferida em</th><th>Erro</th></tr></thead><tbody>'''+
+        (table_rows or '<tr><td colspan="8">Nenhuma tabela descoberta</td></tr>')+'</tbody></table></div>'+tables_nav+'</section>') if automatic else ''
+    if automatic:
+        destination_facts=(_fact('Tabelas em BLUE',a.get('blue_tables',0),'blue-tables')+
+                           _fact('Tabelas em GREEN',a.get('green_tables',0),'green-tables')+
+                           _fact('Publicação','Por tabela','table-publication'))
+    else:
+        destination_facts=(_fact('BLUE v',a.get('blue_version'),'blue')+
+                           _fact('GREEN v',a.get('green_version'),'green')+
+                           _fact('Ativo',a.get('slot'),'active-slot'))
+    ranges_section=('''<section class="section" id="ranges"><h2>Faixas efetivamente promovidas</h2><div class="data"><table>
+        <thead><tr><th>Lote</th><th>Motor</th><th>Intervalo</th><th>Limite observado</th><th>Conferida em</th></tr></thead>
+        <tbody>'''+(ranges or '<tr><td colspan="5">Nenhuma faixa promovida registrada</td></tr>')+
+        '</tbody></table></div>'+ranges_nav+'</section>') if not automatic else ''
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="20"><title>Reconciliação · Saúde ponta a ponta</title>
@@ -435,15 +773,31 @@ h1{{font-size:27px;margin:3px 0 7px}}h2{{font-size:17px;margin:0 0 13px}}p{{colo
 .refresh{{display:inline-flex;align-items:center;gap:7px}}
 .refresh-dot{{width:6px;height:6px;border-radius:50%;background:var(--link)}}
 .state{{border:1px solid var(--line);background:#fff;padding:11px 15px;border-radius:24px;font-weight:700}}
+.has-help{{position:relative}}
+.help{{display:inline-flex;vertical-align:middle;margin-left:6px}}
+.help-button{{display:inline-block;width:18px;height:18px;padding:0;border:1px solid #bcc9d8;border-radius:50%;background:var(--paper);color:var(--link);font:700 11px/16px system-ui;cursor:help}}
+.help-button:focus-visible,.stage-link:focus-visible{{outline:2px solid var(--link);outline-offset:3px}}
+.help-text{{position:absolute;top:calc(100% + 8px);right:0;z-index:40;width:300px;max-width:calc(100vw - 32px);padding:12px 14px;border-radius:10px;background:var(--ink);color:#fff;font:400 12px/1.6 system-ui;text-align:left;white-space:normal;box-shadow:0 8px 24px #18263826;visibility:hidden;opacity:0;pointer-events:none}}
+.help-text::before{{content:"";position:absolute;bottom:100%;left:0;right:0;height:10px}}
+.has-help:hover>.help>.help-text,.has-help:focus-within>.help>.help-text{{visibility:visible;opacity:1;pointer-events:auto}}
+.card>.help,.stage>.help,.facts .has-help>.help{{display:contents}}
+.card>.help>.help-button,.stage>.help>.help-button{{position:absolute;top:12px;right:12px}}
+.facts .has-help{{padding-right:24px}}
+.facts .has-help>.help>.help-button{{position:absolute;top:0;right:0}}
+@media(min-width:901px){{.summary .card:first-child .help-text,.pipeline li:first-child .help-text,.facts .has-help:first-child .help-text,.stages .stage:nth-child(4n+1) .help-text,.columns .section:first-child .facts .help-text{{left:0;right:auto}}}}
 .summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin:21px 0}}
 .card,.section{{border:1px solid var(--line);background:var(--paper);border-radius:13px;padding:18px}}
-.card label{{color:var(--muted);display:block;font-size:12px}}.card strong{{display:block;font-size:25px;margin:7px 0}}
+.card label{{color:var(--muted);display:block;font-size:12px;padding-right:22px}}.card strong{{display:block;font-size:25px;margin:7px 0}}
 .card small{{color:var(--muted)}}.stages{{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:18px 0}}
-.stage{{border:1px solid var(--line);border-left:4px solid #a7b4c6;border-radius:10px;background:white;padding:14px;text-decoration:none;color:var(--ink);min-height:113px}}
-.stage-name{{display:block;font-size:12px;color:var(--muted)}}.stage b{{display:block;margin:9px 0 5px;font-size:16px;overflow-wrap:anywhere}}
+.stage{{border:1px solid var(--line);border-left:4px solid #a7b4c6;border-radius:10px;background:white;color:var(--ink);min-height:113px}}
+.stage-link{{display:block;padding:14px;min-height:113px;color:inherit;text-decoration:none;border-radius:6px}}
+.stage-name{{display:block;font-size:12px;color:var(--muted);padding-right:22px}}.stage b{{display:block;margin:9px 0 5px;font-size:16px;overflow-wrap:anywhere}}
 .stage small{{display:block;color:var(--muted)}}.stage.good{{border-left-color:#26976a}}.stage.warn{{border-left-color:#ce9026}}.stage.bad{{border-left-color:#cd4451}}
 .section{{margin:15px 0;scroll-margin-top:15px}}.columns{{display:grid;grid-template-columns:1fr 1fr;gap:15px}}
 .data{{overflow:auto}}table{{width:100%;border-collapse:collapse;min-width:610px;text-align:left}}
+.pagination{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px}}
+.pagination div{{display:flex;gap:7px;align-items:center;flex-wrap:wrap}}.pagination a,.pagination [aria-current]{{padding:6px 9px;border:1px solid var(--line);border-radius:7px;text-decoration:none;background:var(--paper)}}
+.pagination [aria-current]{{background:#edf2f8;color:var(--ink)}}.pagination a:focus-visible{{outline:2px solid var(--link);outline-offset:2px}}
 th,td{{border-bottom:1px solid var(--line);padding:11px 9px;vertical-align:top;font-size:12px}}th{{color:var(--muted);font-weight:600}}
 .tag{{border-radius:8px;background:#edf2f8;padding:4px 7px}}.alert{{border:1px solid #edcf98;border-radius:9px;padding:10px 12px;margin:8px 0;background:#fffaf0}}
 .alert.critical{{border-color:#e9a1a5;background:#fff3f4}}.alert span{{display:block;margin:5px 0}}.alert small{{color:var(--muted)}}
@@ -452,79 +806,69 @@ code{{font:12px ui-monospace,monospace}}.meter{{height:10px;background:#e7edf3;b
 .facts b{{display:block;font-size:17px}}.facts small{{color:var(--muted)}}.subtle{{font-size:12px;color:var(--muted)}}
 footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer a{{margin-right:18px}}
 @media(max-width:900px){{.stages{{grid-template-columns:repeat(2,1fr)}}.columns{{grid-template-columns:1fr}}}}
+@media(max-width:900px){{.has-help>.help>.help-text{{position:fixed;top:auto;bottom:16px;left:16px;right:16px;width:auto;max-width:none;max-height:45vh;overflow:auto}}}}
 @media(max-width:520px){{main{{padding:19px 12px}}.stages{{grid-template-columns:1fr 1fr}}.stage{{min-height:130px}}}}
 </style></head><body><main>
 <header><div class="header-main"><div class="top">KAFKA RESTORE LAB / OPERAÇÃO</div>
 <h1>Saúde da reconciliação de dados</h1>
 <ol class="pipeline" aria-label="Fluxo de reconciliação">
-<li><span class="pipeline-node">PostgreSQL ou SQL Server</span></li>
-<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">Python</span></li>
-<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node transport">Kafka</span></li>
-<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">Consumer</span></li>
-<li><span class="pipeline-arrow" aria-hidden="true">→</span><span class="pipeline-node">PostgreSQL blue-green</span></li>
+<li>{_pipeline_node('PostgreSQL ou SQL Server','source')}</li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span>{_pipeline_node('Python','extractor')}</li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span>{_pipeline_node('Kafka','kafka',transport=True)}</li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span>{_pipeline_node('Consumer','consumer')}</li>
+<li><span class="pipeline-arrow" aria-hidden="true">→</span>{_pipeline_node('PostgreSQL blue-green','blue-green')}</li>
 </ol>
 <div class="header-meta">
-<span class="reading">Última leitura <time datetime="{_safe(s['checked_at'])}">{_safe(reading_label)}</time><small>UTC−03 · Fortaleza</small></span>
-<span class="refresh"><span class="refresh-dot" aria-hidden="true"></span>Atualização automática · a cada 20 segundos</span>
+<span class="reading has-help">Última leitura <time datetime="{_safe(s['checked_at'])}">{_safe(reading_label)}</time><small>UTC−03 · Fortaleza</small>{_help('last-reading')}</span>
+<span class="refresh has-help"><span class="refresh-dot" aria-hidden="true"></span>Atualização automática · a cada 20 segundos{_help('refresh')}</span>
 </div></div>
-<div class="state">{_safe(state_label)}</div></header>
-<div class="summary">
-<div class="card"><label>Última promoção</label><strong>{_safe(m.get('last_success_age_seconds'))} s</strong><small>Idade da promoção, não da origem</small></div>
-<div class="card"><label>Versão ativa</label><strong>{_safe(a.get('version'))}</strong><small>Slot {_safe(a.get('slot'))} · {_safe(a.get('rows'))} linhas</small></div>
-<div class="card"><label>Lag Kafka</label><strong>{_safe(group.get('lag'))}</strong><small>Offsets pendentes; não equivale a linhas</small></div>
-<div class="card"><label>Cobertura de PK</label><strong>{cover_txt}</strong><small>Janela de {COVERAGE_HOURS} h · não é cobertura de bytes</small></div>
-<div class="card"><label>Falhas / rejeições (24h)</label><strong>{_safe(m.get('failures_24h'))}</strong><small>{_safe(m.get('stalled'))} lote(s) travado(s)</small></div>
-<div class="card"><label>Alterações promovidas (24h)</label><strong>{_safe((m.get('inserted_24h') or 0)+(m.get('updated_24h') or 0)+(m.get('deleted_24h') or 0))}</strong><small>INSERT + UPDATE + DELETE</small></div>
-</div>
+<div class="state has-help">{_safe(state_label)}{_help('overall')}</div></header>
+<div class="summary">{summary}</div>
 <h2>Fluxo ponta a ponta</h2><div class="stages">{stages}</div>
 <div class="columns"><section class="section" id="alerts"><h2>Alertas e próximos passos</h2>
 {alert_html or '<p>Sem alertas detectados pelos sinais disponíveis. Isso não certifica igualdade entre as bases.</p>'}
 </section><section class="section" id="coverage"><h2>Cobertura da reconciliação</h2>
-<div class="facts"><div><small>Espaço de IDs conferido</small><b>{_safe(c.get('covered_ids'))}</b></div>
-<div><small>Limite superior observado</small><b>{_safe(c.get('target_max_id'))}</b></div>
-<div><small>Faixas válidas na janela</small><b>{_safe(c.get('interval_count'))}</b></div></div>
+<div class="facts">{_fact('Tabelas conferidas' if automatic else 'Espaço de IDs conferido',c.get('covered_ids'),'checked-tables' if automatic else 'covered-ids')}
+{_fact('Tabelas visíveis' if automatic else 'Limite superior observado',c.get('target_max_id'),'visible-tables' if automatic else 'target-id')}
+{_fact('Leituras validadas' if automatic else 'Faixas válidas na janela',c.get('interval_count'),'validated-scans' if automatic else 'intervals')}</div>
 <div class="meter"><div style="width:{max(0,min(100,c.get('ratio') or 0))}%"></div></div>
 <p>Estado: <b>{_safe(c.get('status'))}</b> · Primeiras lacunas: {_safe(gaps)}.</p>
-<p class="subtle">Usamos união de faixas promovidas pertencentes à linhagem ativa. Isso não mede quantidade de contratos,
-volume trafegado ou consistência transacional de todo o remoto. Sem meta de cobertura, não há SLO de 100%.</p></section></div>
+<p class="subtle">{'Proporção de tabelas com leitura completa validada na janela. Cada tabela usa sua própria transação; 100% não garante igualdade simultânea de toda a origem.' if automatic else 'Usamos união de faixas promovidas pertencentes à linhagem ativa. Isso não mede quantidade de contratos, volume trafegado ou consistência transacional de todo o remoto. Sem meta de cobertura, não há SLO de 100%.'}</p></section></div>
 <div class="columns"><section class="section" id="source"><h2>Origem e extração</h2>
 <p><b>Conectividade atual da origem: não aferida.</b> O painel não usa credenciais remotas nem aumenta carga no servidor.</p>
 <p>Último lote: {_safe((runs[0] or {}).get('status') if runs else None)} · Origem: {_safe((runs[0] or {}).get('engine') if runs else None)}</p>
 <p>Uma queda antes de criar um lote não aparece como falha da origem. Monitoramos as execuções conhecidas, não uptime real.</p>
 </section><section class="section" id="kafka"><h2>Transporte e consumidor Kafka</h2>
-<div class="facts"><div><small>Brokers</small><b>{_safe(k.get('brokers'))}</b></div>
-<div><small>Partições</small><b>{_safe(k.get('partitions'))}</b></div>
-<div><small>Membros do grupo</small><b>{_safe(group.get('members'))}</b></div>
-<div><small>Consumer lag</small><b>{_safe(group.get('lag'))}</b></div></div>
+<div class="facts">{_fact('Brokers',k.get('brokers'),'brokers')}
+{_fact('Partições',k.get('partitions'),'partitions')}
+{_fact('Membros do grupo',group.get('members'),'members')}
+{_fact('Consumer lag',group.get('lag'),'lag')}</div>
 <p>Dados: {'acessível' if k.get('data_topic') else 'indisponível'} · Auditoria: {'acessível' if k.get('audit_topic') else 'não encontrada'} · Grupo: {_safe(group.get('state'))}</p>
 <p class="subtle">{_safe(k.get('error') or k.get('group_error'))}</p>
 </section></div>
 <div class="columns"><section class="section" id="destination"><h2>Destino e blue-green</h2>
 {('<p class="alert critical">' + _safe(s['local_db'].get('error')) + '</p>') if s['local_db'].get('error') else ''}
-<div class="facts"><div><small>BLUE v</small><b>{_safe(a.get('blue_version'))}</b></div>
-<div><small>GREEN v</small><b>{_safe(a.get('green_version'))}</b></div>
-<div><small>Ativo</small><b>{_safe(a.get('slot'))}</b></div></div>
+<div class="facts">{destination_facts}</div>
 <p>Última transição: {_safe(last.get('action'))} · {_safe(last.get('at'))} · Versão {_safe(last.get('version'))}</p>
 <p class="subtle">A versão ativa é transacional; rollback exige compatibilidade do schema e journal disponível.</p>
 </section><section class="section" id="schema"><h2>DDL e catálogo de schemas</h2>
-<p>Contrato ativo: <code>{_safe((schema.get('active_hash') or '')[:20])}</code></p>
-<p>Pendente: <code>{_safe((schema.get('pending_hash') or '')[:20] if schema.get('pending_hash') else 'nenhum')}</code> · Backfill próximo ID: {_safe(schema.get('backfill_next'))}</p>
-<div class="data"><table><thead><tr><th>Fonte</th><th>Motor</th><th>Última classificação</th><th>Observado</th></tr></thead><tbody>{catalogs or '<tr><td colspan="4">Sem observações registradas</td></tr>'}</tbody></table></div>
+<p>{'Contratos independentes por tabela; consulte os hashes e os destinos no catálogo.' if automatic else 'Contrato ativo: <code>'+_safe((schema.get('active_hash') or '')[:20])+'</code>'}</p>
+{('<p>Schema alterado exige nova cópia completa e validação antes da publicação.</p>') if automatic else '<p>Pendente: <code>'+_safe((schema.get('pending_hash') or '')[:20] if schema.get('pending_hash') else 'nenhum')+'</code> · Backfill próximo ID: '+_safe(schema.get('backfill_next'))+'</p>'}
+<div class="data"><table><thead><tr><th>Fonte</th><th>Motor</th><th>Última classificação</th><th>Observado</th></tr></thead><tbody>{catalogs or '<tr><td colspan="4">Sem observações registradas</td></tr>'}</tbody></table></div>{schema_nav}
 </section></div>
 <section class="section" id="extract"><h2>Resumo de alterações e guardas (24h)</h2>
-<div class="facts"><div><small>INSERT</small><b>{_safe(m.get('inserted_24h'))}</b></div>
-<div><small>UPDATE</small><b>{_safe(m.get('updated_24h'))}</b></div>
-<div><small>DELETE</small><b>{_safe(m.get('deleted_24h'))}</b></div>
-<div><small>Lotes rejeitados</small><b>{_safe(m.get('rejected_24h'))}</b></div>
-<div><small>Bytes JSON publicados</small><b>{_safe(m.get('kafka_bytes_24h'))}</b></div></div>
-<p>Deletes são inferidos somente na faixa validada; rejeições não geram checkpoint de cobertura nem promoção.</p>
+<div class="facts">{_fact('INSERT',m.get('inserted_24h'),'insert')}
+{_fact('UPDATE',m.get('updated_24h'),'update')}
+{_fact('DELETE',m.get('deleted_24h'),'delete')}
+{_fact('Lotes rejeitados',m.get('rejected_24h'),'rejected')}
+{_fact('Bytes JSON publicados',m.get('kafka_bytes_24h'),'json-bytes')}</div>
+<p>{'Deletes são inferidos pela ausência da chave na leitura completa validada. Sem PK, publicamos snapshots e não atribuímos contagens individuais a UPDATE e DELETE. Rejeições preservam a última publicação.' if automatic else 'Deletes são inferidos somente na faixa validada; rejeições não geram checkpoint de cobertura nem promoção.'}</p>
 </section>
+{table_section}
 <section class="section" id="runs"><h2>Últimas execuções · clique no ID para evidências</h2>
 <div class="data"><table><thead><tr><th>ID</th><th>Origem</th><th>Modo</th><th>Faixa</th><th>Estado</th><th>Deltas</th><th>Deletes</th><th>Duração</th><th>Erro</th></tr></thead><tbody>
-{row_html or '<tr><td colspan="9">Nenhuma execução registrada</td></tr>'}</tbody></table></div></section>
-<section class="section"><h2>Faixas efetivamente promovidas</h2><div class="data"><table>
-<thead><tr><th>Lote</th><th>Motor</th><th>Intervalo</th><th>Limite observado</th><th>Conferida em</th></tr></thead>
-<tbody>{ranges or '<tr><td colspan="5">Nenhuma faixa promovida registrada</td></tr>'}</tbody></table></div></section>
+{row_html or '<tr><td colspan="9">Nenhuma execução registrada</td></tr>'}</tbody></table></div>{runs_nav}</section>
+{ranges_section}
 <footer><a href="http://localhost:8080/">Kafbat UI</a><a href="http://localhost:8081/">Adminer</a>
 <a href="/status.json">JSON de saúde</a><a href="/readyz">Readiness</a>
 <p>Indicadores operacionais calculados sobre evidências locais e metadados Kafka. Sem sonda ativa à origem,
@@ -536,6 +880,19 @@ def run_details(rid, connect=psycopg.connect):
     rid=str(UUID(rid))
     with connect(LOCAL_DSN,connect_timeout=3) as conn:
         with conn.cursor() as cur:
+            if SYNC_MODE=='catalog':
+                cur.execute('''SELECT r.run_id::text,t.engine,t.source_schema,t.source_table,
+                    r.mode,r.status,r.manifest,r.base_generation,r.result_generation,
+                    r.full_snapshot,r.delta_count,r.seen_count,r.inserted_count,r.updated_count,
+                    r.deleted_count,r.logical_bytes,r.error,r.started_at,r.finished_at
+                    FROM replica.discovered_runs r JOIN replica.discovered_tables t USING(table_key)
+                    WHERE r.run_id=%s''',(rid,))
+                row=cur.fetchone()
+                if not row:return None
+                keys=('run_id','engine','schema','table','mode','status','manifest','base_generation',
+                      'result_generation','full_snapshot','delta_count','seen_count','inserted_count',
+                      'updated_count','deleted_count','logical_bytes','error','started_at','finished_at')
+                return {key:_iso(value) for key,value in zip(keys,row)}
             cur.execute('''SELECT run_id::text,mode,status,sweep_low,sweep_high,cutoff,
                                  data_schema_hash,delta_count,sweep_count,inserted_count,
                                  updated_count,deleted_count,logical_kafka_bytes,error,
@@ -572,7 +929,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200,'text/html; charset=utf-8',body);return
             snapshot=load_snapshot()
             if path=='/':
-                self._send(200,'text/html; charset=utf-8',render_html(snapshot))
+                pages=page_numbers(parse_qs(urlparse(self.path).query,max_num_fields=20))
+                self._send(200,'text/html; charset=utf-8',render_html(snapshot,pages))
             elif path=='/status.json':
                 self._send(200,'application/json; charset=utf-8',json.dumps(snapshot,ensure_ascii=False,default=str))
             elif path=='/readyz':
