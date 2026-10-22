@@ -66,6 +66,8 @@ services:
   monitor:
     image: $discovery_base-app
     ports: !reset []
+  monitor-collector:
+    image: $discovery_base-app
 YAML
 
 read_local() { compose exec -T local-db psql -X -v ON_ERROR_STOP=1 -U postgres -d lab_local -At -c "$1"; }
@@ -241,10 +243,17 @@ SQL
   expect "SELECT status FROM replica.discovered_tables WHERE source_table='invoices'" missing_or_inaccessible
   expect "SELECT count(*)>0 FROM replica.discovered_blue b JOIN replica.discovered_tables t USING(table_key) WHERE t.source_table='invoices'" t
   compose exec -T monitor python -c '
-import json,urllib.request
-s=json.load(urllib.request.urlopen("http://localhost:8082/status.json"))
+import json,time,urllib.request
+deadline=time.monotonic()+60
+while True:
+    s=json.load(urllib.request.urlopen("http://localhost:8082/status.json"))
+    if s.get("collection",{}).get("ok") and any(t["table"]=="invoices" and t["status"]=="missing_or_inaccessible" for t in s.get("tables",[])):
+        break
+    if time.monotonic()>=deadline:raise AssertionError(s)
+    time.sleep(1)
 assert s["mode"]=="catalog",s
 assert s["local_db"]["ok"],s["local_db"]
+assert s["monitor_db"]["ok"]
 assert any(t["table"]=="invoices" and t["status"]=="missing_or_inaccessible" for t in s["tables"])
 assert urllib.request.urlopen("http://localhost:8082/readyz").status==200
 rid=s["recent_runs"][0]["id"]

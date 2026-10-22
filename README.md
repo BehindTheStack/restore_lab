@@ -32,7 +32,9 @@ flowchart LR
     end
     C --> S
     C --> A
-    M["Monitor · 8082"] -.->|"SELECT local"| A
+    A -.->|"SELECT da auditoria"| MC["Coletor do monitor"]
+    MC -->|"Metadados de operação"| MD[("PostgreSQL do monitor")]
+    M["Monitor · 8082"] -.->|"SELECT"| MD
     M -.->|"Metadados e lag"| K
     U["Kafbat · 8080"] -.-> K
     D["Adminer · 8081"] -.-> V
@@ -218,7 +220,29 @@ Uma tabela com falha mantém a última publicação válida e pode continuar con
 
 Os nomes das tabelas de origem abrem um modal com o DDL reconstruído do catálogo observado. Nas execuções, o DDL corresponde ao contrato registrado no lote. Os IDs abrem as evidências em modal, com navegação de volta ao lote, fechamento por Esc e preservação da página selecionada. A atualização automática pausa enquanto um modal está aberto. A reconstrução não substitui um dump completo: propriedades não registradas, como índices, FKs ou parâmetros de identidade, podem estar ausentes.
 
-O monitor só lê auditoria local como `monitor_reader` e metadados Kafka. Não participa do grupo consumer nem acessa a origem. `/status.json` expõe os indicadores; `/run/<uuid>` mostra evidências do lote; `/healthz` informa que o processo HTTP está vivo; `/readyz` verifica leitura local e tópico Kafka, sem certificar igualdade entre bases.
+O monitor lê somente seu PostgreSQL separado como `monitor_reader` e metadados Kafka. Não recebe credenciais do banco mirror nem da origem e não participa do grupo consumer. `/status.json` expõe os indicadores; `/run/<uuid>` mostra evidências do lote; `/healthz` informa que o processo HTTP está vivo; `/readyz` verifica o banco do monitor, a atualização do coletor, a última leitura da auditoria local e o tópico Kafka, sem certificar igualdade entre bases.
+
+### Banco separado do monitor
+
+O Compose mantém três persistências distintas: origem em `remote-db`/`lab_remote`, réplica em `local-db`/`lab_local` e monitor em `monitor-db`/`lab_monitor`. Cada PostgreSQL tem seu próprio volume. O banco do monitor usa `monitor_data` e não publica porta no host; pelo Adminer, o servidor é `monitor-db`, banco `lab_monitor`, usuário `monitor_reader`, senha `monitor-reader`.
+
+O serviço `monitor-collector` consulta somente a auditoria e o catálogo local com a conta de leitura já existente. Não lê as linhas das views `mirror_*`, os payloads de staging ou o journal de dados. Copia o resumo dos indicadores, as evidências históricas dos lotes e os contratos de DDL para `lab_monitor`, usando `monitor_writer`. O painel recebe apenas a conta SELECT desse novo banco; o coletor é o único componente de monitoramento com credenciais dos dois servidores locais.
+
+Os checkpoints, gerações e registros de execução usados pelo produtor e consumer continuam junto da réplica: são necessários para confirmar a promoção na mesma transação dos dados. O novo banco guarda uma projeção desses metadados para consulta. Sua indisponibilidade não bloqueia bootstrap, sincronização, guardas ou rollback. As publicações da projeção também são transacionais: uma coleta ou gravação incompleta preserva a última cópia completa.
+
+O coletor executa uma tentativa a cada 10 segundos após concluir a anterior. **Última leitura** indica a leitura do painel; **Evidências coletadas** mostra a data da última coleta completa da auditoria. Os sinais Kafka são consultados pelo próprio painel. Se o coletor ficar mais de 60 segundos sem registrar uma tentativa, aparece `MONITOR_COLLECTION_STALE`, e a saúde atual da réplica fica não aferida. `MONITOR_DB_DOWN` identifica falha no banco separado; `LOCAL_DB_DOWN` ou `LOCAL_DB_READ_ERROR` identificam erro na leitura da réplica reportado pelo coletor. O histórico já copiado continua consultável em caso de falha da réplica, enquanto o banco do monitor estiver acessível.
+
+Para atualizar uma instalação existente, preservando os volumes da origem e do mirror:
+
+```bash
+docker compose up -d --build monitor-db monitor-collector monitor
+docker compose logs --tail 80 monitor-collector monitor
+curl --fail http://localhost:8082/readyz
+```
+
+A primeira coleta recompõe o histórico disponível na auditoria local, incluindo evidências fora das 40 execuções exibidas na página. Não é necessário apagar volumes nem refazer bootstrap. O monitor pode exibir aviso de coleta pendente durante essa preparação. Para executar o processo HTTP fora do Compose, `MONITOR_DSN` seleciona o banco separado; o modo de leitura direta com `LOCAL_DSN` permanece disponível para compatibilidade.
+
+Nesta implementação, cada coleta percorre os metadados históricos para também capturar conclusões tardias e alterações de estado, com memória limitada e gravação apenas dos documentos divergentes. O custo cresce com o histórico, e não há retenção automática. Os limites de janela e de lotes travados devem ser configurados no **coletor**, que calcula esses indicadores; mantenha os mesmos valores no painel para os rótulos e alertas.
 
 Parâmetros do serviço `monitor`:
 
@@ -229,6 +253,10 @@ Parâmetros do serviço `monitor`:
 | `LAB_STALLED_MINUTES` | `15` | Alerta para lote pendente há muito tempo. |
 | `LAB_MAX_CONSUMER_LAG` | `1000` | Limite do alerta de offsets pendentes. |
 | `LAB_EXPECTED_INTERVAL_MINUTES` | `0` | Meta opcional de idade da última promoção; zero desabilita. |
+| `MONITOR_DSN` | `monitor-db` / `lab_monitor` no Compose | Conexão SELECT do painel ao banco separado. |
+| `LAB_MONITOR_COLLECTION_MAX_AGE` | `60` | Tempo máximo, em segundos, sem tentativa do coletor antes do alerta de evidências desatualizadas. |
+
+Parâmetros exclusivos de `monitor-collector`: `LOCAL_DSN` é a conexão SELECT à auditoria da réplica; `MONITOR_WRITE_DSN` escreve somente a projeção; `LAB_MONITOR_COLLECTION_SECONDS` define o intervalo entre tentativas, com padrão de 10 segundos. `LAB_SYNC_MODE`, `LAB_COVERAGE_WINDOW_HOURS`, `LAB_MAX_COVERAGE_INTERVALS` e `LAB_STALLED_MINUTES` controlam a coleta. Ao trocar para o fluxo legado, ajuste `LAB_SYNC_MODE=legacy` tanto no coletor quanto no painel.
 
 ## Componentes e serviços
 
@@ -241,7 +269,9 @@ Parâmetros do serviço `monitor`:
 | `consumer` | Consome eventos, valida o lote e promove cada tabela transacionalmente. | Padrão |
 | `init` | Prepara proxy, descobre tabelas, inicializa as novas e aguarda promoção. | Padrão, execução única |
 | `scheduler` | Executa os ciclos PostgreSQL após `init`, sem sobrepor ciclos. | Padrão |
-| `monitor` | Painel HTTP de evidências locais e metadados Kafka. | Padrão, porta 8082 |
+| `monitor-db` | PostgreSQL exclusivo das evidências do monitor, volume `monitor_data`, sem porta no host. | Padrão |
+| `monitor-collector` | Lê auditoria da réplica com SELECT e atualiza a projeção no banco do monitor. | Padrão |
+| `monitor` | Painel HTTP com leitura no banco separado e consulta de metadados Kafka. | Padrão, porta 8082 |
 | `kafbat` | Interface de tópicos, mensagens, grupos e offsets. | Padrão, porta 8080 |
 | `adminer` | Interface de consultas aos bancos do laboratório. | Padrão, porta 8081 |
 | `cli` | Comandos manuais PostgreSQL, diagnóstico e recuperação. | Perfil `tools`, ou `run cli` |
@@ -259,6 +289,8 @@ Parâmetros do serviço `monitor`:
 | `app/discovery_store.py` | Schema local automático, staging por tabela, views tipadas, slots, journal, promoção, retirada e rollback. |
 | `app/monitor.py` | Consultas de auditoria, alertas, HTML, paginação e endpoints dos detalhes. |
 | `app/monitor_details.py` | Reconstrução do DDL observado e apresentação segura dos detalhes das execuções. |
+| `app/monitor_collect.py` | Coleta consistente de metadados locais e publicação transacional no banco do monitor. |
+| `app/monitor_store.py` | Leitura da projeção e dos detalhes históricos, com verificação de atualização da coleta. |
 | `app/monitor_ui.js` | Modais acessíveis, consulta dos detalhes e pausa da atualização durante a leitura. |
 | `app/startup.py` | Inicialização compatível com o fluxo legado de contratos. |
 | `app/schema_evolution.py` | Planejamento, aprovação e backfill de schema no fluxo legado. |
@@ -266,7 +298,8 @@ Parâmetros do serviço `monitor`:
 | `app/canonical_contract.py` | Representação canônica dos contratos legados entre motores. |
 | `app/mssql_sync.py` | Extração SQL Server do contrato legado e configuração de seu proxy. |
 | `app/sqlserver_fixture.py` | Ações administrativas restritas à fixture SQL Server. |
-| `sql/local.sql` | Estrutura inicial local e conta de leitura do monitor. |
+| `sql/local.sql` | Estrutura inicial da réplica e conta de leitura usada pelo coletor. |
+| `sql/monitor.sql` | Banco exclusivo de monitoramento, projeção e contas separadas de escrita e leitura. |
 | `sql/remote.sql` | Fixture PostgreSQL, dados iniciais e concessões SELECT. |
 | `tests/` | Contratos offline e cenários integrados em projetos descartáveis. |
 
@@ -500,6 +533,7 @@ python3 tests/check_static.py
 python3 tests/test_discovery_catalog.py
 python3 tests/test_monitor.py
 python3 tests/test_monitor_modals.py
+python3 tests/test_monitor_storage.py
 python3 tests/test_startup.py
 python3 tests/test_reconcile.py
 python3 tests/test_generation_paths.py
@@ -521,6 +555,8 @@ LAB_DISCOVERY_TEST=1 LAB_DISCOVERY_ENGINE=sqlserver bash tests/e2e_discovery.sh
 O teste valida início padrão, recusa de escrita pela conta SELECT, descoberta, INSERT/UPDATE/DELETE, rollback compatível, guarda de exclusão, ADD/ALTER COLUMN, bloqueio de rollback incompatível, PK composta, tabela sem PK, DROP seguro, evidências HTTP e paginação. O teste SQL Server desabilita SNAPSHOT na fixture para exercitar o fallback SERIALIZABLE sem permissão administrativa no produtor. Os recursos e volumes criados pelo teste são removidos ao terminar.
 
 Para conferir promoção idempotente, limpeza de lotes abortados e distinção entre SELECT negado e catálogo ausente no armazenamento local, execute `docker compose exec -T -e LAB_DISCOVERY_STORE_TEST=1 consumer python - < tests/test_discovery_store_live.py`. Esse teste cria objetos dentro de uma transação e desfaz tudo com ROLLBACK; não acessa a origem.
+
+Para validar a separação do monitor, execute `LAB_MONITOR_STORAGE_TEST=1 bash tests/e2e_monitor_storage.sh`. O teste usa um projeto Docker descartável sem portas publicadas, verifica permissões, histórico completo, DDL em modal, publicação atômica e alertas de coleta. Também desliga o banco do monitor, confirma que a replicação continua e verifica a recuperação. Os containers e volumes de teste são removidos ao terminar.
 
 Com o monitor inicializado e Playwright instalado no ambiente de testes, `LAB_MONITOR_BROWSER_TEST=1 node tests/e2e_monitor_modals.cjs` verifica os modais no navegador: teclado, foco, DDL histórico, navegação de volta, pausa da atualização, paginação e layout móvel. `LAB_MONITOR_URL` permite escolher outra instância; `PLAYWRIGHT_CHROMIUM_EXECUTABLE` permite indicar o navegador instalado.
 

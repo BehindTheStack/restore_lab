@@ -96,8 +96,8 @@ services:
       REMOTE_DIRECT_DSN: "host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=postgres password=lab-admin connect_timeout=4"
       KAFKA_BOOTSTRAP: kafka:19092
-      KAFKA_TOPIC: lab.sync.events.v6
-      KAFKA_AUDIT_TOPIC: lab.sync.audit.v6
+      KAFKA_TOPIC: lab.sync.events
+      KAFKA_AUDIT_TOPIC: lab.sync.audit
       MAX_REMOVE_FRACTION: "0.20"
       TOXIPROXY_URL: http://toxiproxy:8474
     command: ["consume"]
@@ -214,16 +214,52 @@ services:
       init:
         condition: service_completed_successfully
 
-  # Read-only end-to-end operations UI, included in the default stack.
+  # Independent monitor projection; no mirrored business rows.
+  monitor-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: monitor-admin
+      POSTGRES_DB: lab_monitor
+    volumes:
+      - monitor_data:/var/lib/postgresql/data
+      - ./sql/monitor.sql:/docker-entrypoint-initdb.d/01-monitor.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d lab_monitor"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # The only monitor component that can SELECT local replication audit.
+  monitor-collector:
+    build: ./app
+    image: *app-image
+    entrypoint: ["python", "-u", "/app/monitor_collect.py"]
+    environment:
+      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
+      MONITOR_WRITE_DSN: "host=monitor-db port=5432 dbname=lab_monitor user=monitor_writer password=monitor-writer connect_timeout=3"
+      KAFKA_BOOTSTRAP: kafka:19092
+      LAB_SYNC_MODE: catalog
+      LAB_STALLED_MINUTES: "15"
+      LAB_COVERAGE_WINDOW_HOURS: "24"
+      LAB_MAX_COVERAGE_INTERVALS: "20000"
+      LAB_MONITOR_COLLECTION_SECONDS: "10"
+    depends_on:
+      local-db:
+        condition: service_started
+      monitor-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # UI reads only its own DB and Kafka metadata; no mirror connection.
   monitor:
     build: ./app
     image: *app-image
     entrypoint: ["python", "-u", "/app/monitor.py"]
     environment:
-      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
+      MONITOR_DSN: "host=monitor-db port=5432 dbname=lab_monitor user=monitor_reader password=monitor-reader connect_timeout=3"
       KAFKA_BOOTSTRAP: kafka:19092
-      KAFKA_TOPIC: lab.sync.events.v6
-      KAFKA_AUDIT_TOPIC: lab.sync.audit.v6
+      KAFKA_TOPIC: lab.sync.events
+      KAFKA_AUDIT_TOPIC: lab.sync.audit
       LAB_CONSUMER_GROUP: lab-range-bluegreen-v4
       LAB_SYNC_MODE: catalog
       LAB_STALLED_MINUTES: "15"
@@ -232,11 +268,14 @@ services:
       LAB_EXPECTED_INTERVAL_MINUTES: "0" # optional freshness alert; 0 disables it
       LAB_MAX_CONSUMER_LAG: "1000"
       LAB_MONITOR_PORT: "8082"
+      LAB_MONITOR_COLLECTION_MAX_AGE: "60"
     ports:
       - "127.0.0.1:8082:8082"
     depends_on:
-      local-db:
+      monitor-db:
         condition: service_healthy
+      monitor-collector:
+        condition: service_started
       kafka:
         condition: service_started
     restart: unless-stopped
@@ -273,3 +312,4 @@ volumes:
   local_data:
   kafka_data:
   mssql_data:
+  monitor_data:

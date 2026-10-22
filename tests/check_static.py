@@ -22,6 +22,16 @@ assert 'local_in_range' in on_end
 assert 'sha256' in source and 'jsonb_build_array' in source
 assert 'updated_at' not in producer and 'deleted_at' not in producer
 compose=yaml.safe_load((ROOT/'docker-compose.yml').read_text())
+monitor_services=compose['services']
+assert 'MONITOR_DSN' in monitor_services['monitor']['environment']
+assert 'LOCAL_DSN' not in monitor_services['monitor']['environment']
+assert 'REMOTE_DSN' not in monitor_services['monitor']['environment']
+assert 'monitor-db' not in monitor_services['consumer']['depends_on']
+assert 'monitor-db' not in monitor_services['scheduler']['depends_on']
+assert not monitor_services['monitor-db'].get('ports')
+assert 'monitor_data' in compose['volumes']
+assert 'user=monitor_reader' in monitor_services['monitor-collector']['environment']['LOCAL_DSN']
+assert 'user=monitor_writer' in monitor_services['monitor-collector']['environment']['MONITOR_WRITE_DSN']
 assert compose['services']['consumer']['environment']['REMOTE_DSN'].count('user=remote_reader') == 1
 assert 'REMOTE_ADMIN_DSN' not in compose['services']['consumer']['environment']
 assert 'REMOTE_ADMIN_DSN' not in compose['services']['cli']['environment']

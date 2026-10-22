@@ -20,11 +20,14 @@ import psycopg
 from confluent_kafka import ConsumerGroupTopicPartitions, TopicPartition
 from confluent_kafka.admin import AdminClient, OffsetSpec
 import monitor_details as details
+import monitor_store
 
-LOCAL_DSN = os.environ['LOCAL_DSN']
+LOCAL_DSN = os.getenv('LOCAL_DSN')
+MONITOR_DSN = os.getenv('MONITOR_DSN')
+COLLECTION_MAX_AGE = int(os.getenv('LAB_MONITOR_COLLECTION_MAX_AGE', '60'))
 BOOTSTRAP = os.environ['KAFKA_BOOTSTRAP']
-TOPIC = os.getenv('KAFKA_TOPIC', 'lab.sync.events.v6')
-AUDIT_TOPIC = os.getenv('KAFKA_AUDIT_TOPIC', 'lab.sync.audit.v6')
+TOPIC = os.getenv('KAFKA_TOPIC', 'lab.sync.events')
+AUDIT_TOPIC = os.getenv('KAFKA_AUDIT_TOPIC', 'lab.sync.audit')
 GROUP = os.getenv('LAB_CONSUMER_GROUP', 'lab-range-bluegreen-v4')
 PORT = int(os.getenv('LAB_MONITOR_PORT', '8082'))
 STALLED_MIN = int(os.getenv('LAB_STALLED_MINUTES', '15'))
@@ -346,7 +349,16 @@ def evaluate(snapshot):
     alarms=[]
     def alert(level, key, msg, action):
         alarms.append({'severity':level,'code':key,'message':msg,'action':action})
-    if not snapshot['local_db']['ok']:
+    store_down = 'monitor_db' in snapshot and not snapshot['monitor_db']['ok']
+    collection_stale = 'collection' in snapshot and not snapshot['collection']['ok']
+    if store_down:
+        alert('critical','MONITOR_DB_DOWN','Banco do monitor indisponível ou sem acesso',
+              'Conferir monitor-db e a conexão de leitura do painel. ' +
+              (snapshot['monitor_db'].get('error') or ''))
+    elif collection_stale:
+        alert('critical','MONITOR_COLLECTION_STALE','Evidências do monitor sem atualização',
+              'Conferir monitor-collector. ' + (snapshot['collection'].get('error') or ''))
+    elif not snapshot['local_db']['ok']:
         if snapshot['local_db'].get('connected'):
             action = ('Executar a inicialização para recompor a leitura de monitor_reader.'
                       if snapshot['local_db'].get('error_code') == '42501' else
@@ -359,7 +371,7 @@ def evaluate(snapshot):
     if not snapshot['kafka']['ok']:
         alert('critical','KAFKA_DOWN','Kafka ou tópico de dados indisponível',
               'Inspecionar broker e tópico no Kafbat.')
-    if not snapshot['local_db']['ok']:
+    if store_down or collection_stale or not snapshot['local_db']['ok']:
         return 'unavailable',alarms
     a=snapshot.get('active') or {}
     m=snapshot.get('metrics') or {}
@@ -429,13 +441,22 @@ def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka)
              'Sem CDC, mudanças após uma faixa só aparecem na próxima varredura daquela faixa.'
            ]}
     try:
-        with connect(LOCAL_DSN,connect_timeout=3) as conn:
-            state['local_db']['connected']=True
-            state.update(_query_db(conn,now))
-        state['local_db']['ok']=True
+        if MONITOR_DSN:
+            state['monitor_db']={'ok':False,'error':None}
+            with connect(MONITOR_DSN,connect_timeout=3) as conn:
+                payload, collection = monitor_store.read_snapshot(conn,SYNC_MODE,now,COLLECTION_MAX_AGE)
+                state.update(payload)
+                state['collection']=collection
+            state['monitor_db']['ok']=True
+        else:
+            with connect(LOCAL_DSN,connect_timeout=3) as conn:
+                state['local_db']['connected']=True
+                state.update(_query_db(conn,now))
+            state['local_db']['ok']=True
     except Exception as exc:
-        state['local_db']['error']=f'{type(exc).__name__}: {str(exc)[:230]}'
-        state['local_db']['error_code']=getattr(exc,'sqlstate',None)
+        failed_db = state['monitor_db'] if MONITOR_DSN else state['local_db']
+        failed_db['error']=f'{type(exc).__name__}: {str(exc)[:230]}'
+        failed_db['error_code']=getattr(exc,'sqlstate',None)
     try:
         state['kafka']=kafka_probe()
     except Exception as exc:
@@ -454,6 +475,9 @@ def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka)
 
 
 HELP = {
+    'collection': ('Evidências coletadas', 'Momento da última coleta completa da auditoria da réplica. '
+                   'O painel lê uma cópia em banco separado, atualizada pelo coletor a cada 10 segundos '
+                   'na configuração padrão. Uma coleta antiga gera alerta e não comprova a saúde atual do destino.'),
     'catalog-coverage': ('Cobertura de tabelas', 'Proporção das tabelas visíveis que tiveram uma leitura '
                          'completa validada dentro da janela. Cada tabela é conferida em sua própria transação. '
                          '100% indica leituras concluídas na janela, sem garantir igualdade simultânea de toda a origem.'),
@@ -688,8 +712,9 @@ def render_html(s, pages=None):
     state_label={'operational':'Serviços prontos · leituras por tabela' if automatic else 'Serviços prontos · integridade por faixas',
                  'attention':'Atenção operacional','not_initialized':'Bootstrap pendente',
                  'unavailable':'Falha operacional'}[s['overall']]
-    runtime='good' if s['local_db']['ok'] else 'bad'
-    db_label=('Acessível' if s['local_db']['ok'] else
+    collection_unknown = ('monitor_db' in s and not s['monitor_db']['ok']) or ('collection' in s and not s['collection']['ok'])
+    runtime='unknown' if collection_unknown else 'good' if s['local_db']['ok'] else 'bad'
+    db_label=('Não aferido' if collection_unknown else 'Acessível' if s['local_db']['ok'] else
               'Erro de leitura' if s['local_db'].get('connected') else 'Indisponível')
     kafka_state='good' if k.get('ok') else 'bad'
     if group.get('lag') is None: group_state='unknown';lag='Não medido'
@@ -805,6 +830,9 @@ def render_html(s, pages=None):
         <thead><tr><th>Lote</th><th>Motor</th><th>Intervalo</th><th>Limite observado</th><th>Conferida em</th></tr></thead>
         <tbody>'''+(ranges or '<tr><td colspan="5">Nenhuma faixa promovida registrada</td></tr>')+
         '</tbody></table></div>'+ranges_nav+'</section>') if not automatic else ''
+    collection_meta = ('<span class="reading has-help">Evidências coletadas '+
+                       _date_time((s.get('collection') or {}).get('collected_at'))+
+                       _help('collection')+'</span>') if 'monitor_db' in s else ''
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <noscript><meta http-equiv="refresh" content="20"></noscript><title>Reconciliação · Saúde ponta a ponta</title>
@@ -890,6 +918,7 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 </ol>
 <div class="header-meta">
 <span class="reading has-help">Última leitura {_date_time(s['checked_at'])}<small>UTC−03 · Fortaleza</small>{_help('last-reading')}</span>
+{collection_meta}
 <span class="refresh has-help"><span class="refresh-dot" aria-hidden="true"></span>Atualização automática · a cada 20 segundos{_help('refresh')}</span>
 </div></div>
 <div class="state has-help">{_safe(state_label)}{_help('overall')}</div></header>
@@ -959,6 +988,9 @@ sem instrumentação extra, sem alterações de dados pelo painel e sem promessa
 
 def run_details(rid, connect=psycopg.connect):
     rid=str(UUID(rid))
+    if MONITOR_DSN:
+        with connect(MONITOR_DSN,connect_timeout=3) as conn:
+            return monitor_store.read_detail(conn,SYNC_MODE,'run',rid)
     with connect(LOCAL_DSN,connect_timeout=3) as conn:
         with conn.cursor() as cur:
             if SYNC_MODE=='catalog':
@@ -1002,6 +1034,12 @@ def ddl_details(query, connect=psycopg.connect):
         value=str(UUID(value))
     if key=='source_key' and (not value or len(value)>200 or '\x00' in value):
         raise ValueError('Invalid source key')
+    if MONITOR_DSN:
+        with connect(MONITOR_DSN,connect_timeout=3) as conn:
+            record=monitor_store.read_detail(conn,SYNC_MODE,'run' if key=='run_id' else key,value)
+            if key=='run_id':
+                return monitor_store.ddl_from_run(record)
+            return record if record and (record.get('manifest') or {}).get('columns') else None
     with connect(LOCAL_DSN,connect_timeout=3) as conn:
         with conn.cursor() as cur:
             if key=='table_key':
@@ -1067,7 +1105,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/status.json':
                 self._send(200,'application/json; charset=utf-8',json.dumps(snapshot,ensure_ascii=False,default=str))
             elif path=='/readyz':
-                ready=snapshot['local_db']['ok'] and snapshot['kafka']['ok']
+                ready=(snapshot['local_db']['ok'] and snapshot['kafka']['ok'] and
+                       snapshot.get('monitor_db',{'ok':True})['ok'] and
+                       snapshot.get('collection',{'ok':True})['ok'])
                 self._send(200 if ready else 503,'application/json',json.dumps({'dependencies_ready':ready}))
         except Exception as exc:
             self._send(503,'application/json',json.dumps({'error':f'{type(exc).__name__}: {str(exc)[:150]}'}))
@@ -1086,7 +1126,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__=='__main__':
     if not (1<=PORT<=65535 and STALLED_MIN>0 and COVERAGE_HOURS>0 and MAX_LAG>=0
-            and 0<=EXPECTED_INTERVAL_MIN and 100<=MAX_RANGES<=100000):
+            and 0<=EXPECTED_INTERVAL_MIN and 100<=MAX_RANGES<=100000 and COLLECTION_MAX_AGE>0):
         raise ValueError('Invalid monitoring configuration')
+    if not (MONITOR_DSN or LOCAL_DSN):
+        raise ValueError('MONITOR_DSN is required (LOCAL_DSN supports direct legacy monitoring)')
     print(f'monitoring http://0.0.0.0:{PORT} (Compose exposes loopback only)',flush=True)
     ThreadingHTTPServer(('0.0.0.0',PORT),Handler).serve_forever()
