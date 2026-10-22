@@ -3,12 +3,57 @@
 Laboratório de descoberta e reconciliação de tabelas de uma origem PostgreSQL ou SQL Server para PostgreSQL local, com Python, Kafka e publicação blue-green por tabela. A aplicação usa uma conta com **SELECT na origem**: não instala triggers, não habilita CDC, não cria tabelas de controle remotas e não executa DDL ou DML remoto.
 
 ```bash
+cp .env.example .env
+cp .env.local.example .env.local
 docker compose up -d --build
 ```
+
+Faça as cópias apenas na primeira configuração, preservando arquivos locais já existentes. `.env` contém os padrões do laboratório; `.env.local` começa apenas com exemplos comentados de sobrescritas. Veja [Arquivos de ambiente](#arquivos-de-ambiente) para aplicar essas sobrescritas.
 
 Esse comando inicia o cenário PostgreSQL, prepara o proxy, descobre as tabelas, publica o bootstrap das tabelas ainda não inicializadas, aguarda a promoção pelo consumer e inicia o scheduler. O monitor faz parte do conjunto padrão: [localhost:8082](http://localhost:8082).
 
 Os bancos de origem do Compose são fixtures com dados fictícios. A reconciliação padrão **lê integralmente cada tabela a cada ciclo**. O laboratório não foi homologado para produção ou bases de centenas de gigabytes.
+
+## Arquivos de ambiente
+
+O Compose interpola as variáveis de `.env` no `docker-compose.yml` e envia a cada serviço apenas as entradas declaradas no seu `environment`. Não há carregamento de dotenv pelo Python. O YAML mantém os valores padrão, permitindo iniciar as fixtures mesmo sem os arquivos locais.
+
+| Arquivo | Uso |
+| --- | --- |
+| `.env.example` | Modelo versionado dos padrões de portas, credenciais das fixtures, sincronização e monitoramento. |
+| `.env` | Configuração local lida automaticamente pelo Compose; ignorada pelo Git. |
+| `.env.local.example` | Modelo versionado de sobrescritas opcionais, inicialmente comentadas. |
+| `.env.local` | Sobrescritas da máquina, ignoradas pelo Git; exigem os argumentos `--env-file`. |
+
+Para usar `.env.local`, informe os dois arquivos, nessa ordem, em **todos os comandos** da instância personalizada:
+
+```bash
+docker compose --env-file .env --env-file .env.local config --quiet
+docker compose --env-file .env --env-file .env.local up -d --build
+docker compose --env-file .env --env-file .env.local run --rm cli discover status
+docker compose --env-file .env --env-file .env.local logs --tail 30 scheduler consumer
+```
+
+O segundo arquivo sobrescreve o primeiro. Variáveis já exportadas no shell têm prioridade sobre ambos. Os demais exemplos deste README usam `docker compose` com `.env`; acrescente os dois `--env-file` se estiver usando sobrescritas. Os arquivos são de configuração do Compose, com nomes de serviços da rede Docker; não são um ambiente para executar a aplicação diretamente no host.
+
+| Configuração | Variáveis |
+| --- | --- |
+| Portas no host | `REMOTE_DB_HOST_PORT`, `LOCAL_DB_HOST_PORT`, `MSSQL_HOST_PORT`, `KAFKA_HOST_PORT`, `TOXIPROXY_HOST_PORT`, `KAFBAT_HOST_PORT`, `ADMINER_HOST_PORT`, `MONITOR_HOST_PORT`. |
+| Administração das fixtures | `REMOTE_ADMIN_PASSWORD`, `LOCAL_ADMIN_PASSWORD`, `MONITOR_ADMIN_PASSWORD`, `MSSQL_SA_PASSWORD`. |
+| Descoberta e proteção | `SOURCE_SCHEMAS`, `MAX_REMOVE_FRACTION`, `SCHEDULER_INTERVAL_SECONDS`, `INIT_PROMOTION_TIMEOUT_SECONDS`. |
+| Kafka e proxy | `KAFKA_BOOTSTRAP`, `KAFKA_TOPIC`, `KAFKA_AUDIT_TOPIC`, `TOXIPROXY_URL`. |
+| Origem SQL Server | `MSSQL_HOST`, `MSSQL_PORT`, `MSSQL_USER`, `MSSQL_PASSWORD`, `MSSQL_DATABASE`. |
+| Painel e coletor | Variáveis `LAB_*` descritas em [Monitor: como interpretar](#monitor-como-interpretar). |
+
+As portas internas permanecem fixas. Por exemplo, `MONITOR_HOST_PORT=8182` muda o acesso para `http://localhost:8182`, enquanto o processo e seu healthcheck continuam na porta 8082 do container. `KAFKA_HOST_PORT` também atualiza o endereço anunciado para clientes no host; os containers continuam usando `kafka:19092`.
+
+As senhas fornecidas são públicas e exclusivas das fixtures descartáveis. Os nomes dos bancos e as contas de leitura/escrita provisionadas continuam definidos em `sql/remote.sql`, `sql/local.sql`, `sql/monitor.sql` e `app/sqlserver_fixture.py`. Alterar `MSSQL_PASSWORD` muda a conexão, sem alterar a senha do login na origem. Alterar uma senha administrativa em `.env` também não muda a senha já gravada num volume: atualize a conta no banco antes de recriar os serviços com o novo valor. `LOCAL_ADMIN_PASSWORD` alimenta tanto `local-db` quanto as conexões administrativas da aplicação.
+
+`REMOTE_DSN` e `REMOTE_DIRECT_DSN` podem sobrescrever as conexões PostgreSQL completas; os exemplos estão em `.env.local.example`. O proxy `remote_pg` é criado com upstream `remote-db:5432`: alterar o DSN direto não reconfigura esse proxy. As credenciais administrativas da origem continuam restritas ao banco e aos serviços de fixture; o produtor recebe somente as credenciais SELECT da origem.
+
+Depois de editar a configuração, use `docker compose config --quiet` para validar e `docker compose up -d` para recriar os serviços afetados. `restart` não carrega novas variáveis. A forma sem `--quiet` exibe a configuração resolvida, incluindo senhas.
+
+O build usa `./app` como contexto. Por isso, as exclusões ficam em `app/.dockerignore`, que remove caches Python, ambientes virtuais, logs e arquivos `.env*` do contexto enviado ao builder. Os arquivos de ambiente da raiz já ficam fora desse contexto. O Dockerfile copia explicitamente os arquivos necessários à aplicação.
 
 ## Arquitetura
 
@@ -123,13 +168,13 @@ docker compose logs --tail 30 init scheduler consumer
 docker compose run --rm cli discover status
 ```
 
-`init` deve terminar com código zero. O scheduler depende desse sucesso e executa ciclos com intervalo de 60 segundos **após concluir o ciclo anterior**. Reiniciar a aplicação não repete bootstrap de tabelas já inicializadas; compara a publicação existente. Tabelas novas recebem seu próprio bootstrap.
+`init` deve terminar com código zero. O scheduler depende desse sucesso e executa ciclos com intervalo de 60 segundos por padrão (`SCHEDULER_INTERVAL_SECONDS`) **após concluir o ciclo anterior**. Reiniciar a aplicação não repete bootstrap de tabelas já inicializadas; compara a publicação existente. Tabelas novas recebem seu próprio bootstrap.
 
 ```bash
 docker compose exec local-db psql -U postgres -d lab_local -c 'SELECT count(*) FROM mirror_public.contracts;'
 ```
 
-A fixture inicial contém 10.000 contratos. Consulte o monitor, o [Kafbat](http://localhost:8080) e o [Adminer](http://localhost:8081). No Adminer: sistema PostgreSQL, servidor `local-db`, usuário `postgres`, senha `lab-admin`, banco `lab_local`.
+A fixture inicial contém 10.000 contratos. Consulte o monitor, o [Kafbat](http://localhost:8080) e o [Adminer](http://localhost:8081), nas portas padrão. No Adminer: sistema PostgreSQL, servidor `local-db`, usuário `postgres`, senha definida em `LOCAL_ADMIN_PASSWORD` (padrão `lab-admin`), banco `lab_local`.
 
 ### 2. Descobrir uma tabela e sincronizar alterações
 
@@ -283,6 +328,8 @@ Parâmetros exclusivos de `monitor-collector`: `LOCAL_DSN` é a conexão SELECT 
 
 | Arquivo | Responsabilidade |
 | --- | --- |
+| `.env.example` / `.env.local.example` | Modelos versionados da configuração do Compose e das sobrescritas locais. |
+| `app/.dockerignore` | Exclusões do contexto de build `./app`. |
 | `app/lab.py` | CLI, transporte Kafka, consumer e integração com o fluxo legado. |
 | `app/discovery_catalog.py` | Catálogos PostgreSQL/SQL Server, permissões observáveis, identificadores, mapeamento de tipos e leitura consistente. |
 | `app/discovery_sync.py` | Orquestra descoberta, comparação, publicação, espera da promoção e scheduler. |
@@ -335,10 +382,10 @@ Os comandos abaixo usam a origem PostgreSQL padrão. Para SQL Server, substitua 
    docker compose stop scheduler
    ```
 
-3. Em `docker-compose.yml`, localize `MAX_REMOVE_FRACTION` no ambiente do `consumer`, anote o valor anterior e ajuste apenas essa variável. Use um limite que comporte a proporção revisada; por exemplo, para remover 40%:
+3. Em `.env` (ou `.env.local`, se estiver usando os dois `--env-file`), localize `MAX_REMOVE_FRACTION`, anote o valor anterior e ajuste apenas essa variável. Use um limite que comporte a proporção revisada; por exemplo, para remover 40%:
 
-   ```yaml
-   MAX_REMOVE_FRACTION: "0.50"
+   ```dotenv
+   MAX_REMOVE_FRACTION=0.50
    ```
 
    `"1.00"` permite remover até 100% das linhas, inclusive esvaziar tabelas. Use esse valor somente quando essa possibilidade tiver sido conferida nas tabelas que serão reconciliadas. Alterar a variável apenas na CLI não modifica a validação do consumer.
@@ -353,7 +400,7 @@ Os comandos abaixo usam a origem PostgreSQL padrão. Para SQL Server, substitua 
 
 5. Confira o resultado antes de retomar a rotina. A tabela deve estar `active`, sem erro atual e com a contagem esperada. No monitor, o novo lote deve estar `promoted`. Para o exemplo, confira também `SELECT count(*) FROM mirror_public.lab_teste_ddl;` no banco local e as linhas esperadas. O histórico e o contador de rejeições das últimas 24 horas ainda incluem o lote anterior.
 
-6. Restaure em `docker-compose.yml` o valor anotado (`"0.20"` no padrão) e recrie novamente o consumer, **mesmo se a tentativa falhar**:
+6. Restaure no mesmo arquivo de ambiente o valor anotado (`0.20` no padrão) e recrie novamente o consumer, **mesmo se a tentativa falhar**:
 
    ```bash
    docker compose up -d --no-deps --force-recreate consumer
