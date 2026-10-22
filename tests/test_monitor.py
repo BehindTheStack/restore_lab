@@ -9,6 +9,7 @@ from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 root=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(root/'app'))
 os.environ.setdefault('LOCAL_DSN','host=fake user=monitor_reader')
 os.environ.setdefault('KAFKA_BOOTSTRAP','fake:9092')
 try:import psycopg
@@ -147,7 +148,7 @@ def test_explanations_have_unique_accessible_targets_and_preserve_navigation():
                 self.ids.add(attrs['id'])
             if attrs.get('role')=='tooltip':
                 self.tooltips.add(attrs['id'])
-            if tag=='button':
+            if tag=='button' and attrs.get('class')=='help-button':
                 assert 'a' not in self.stack, 'Help buttons must not be nested inside navigation links'
                 assert attrs.get('type')=='button'
                 assert attrs.get('aria-label')
@@ -185,6 +186,35 @@ def test_permissions_and_protocol():
     assert 'CREATE TABLE replica.range_checkpoints' in (root/'sql/local.sql').read_text()
 
 
+def test_transport_activity_distinguishes_missing_evidence_from_empty_queue():
+    kafka={'ok':True,'audit_topic':True,'group':{'lag':0,'members':1,'state':'stable'}}
+    assert m._transport_activity(kafka)[0]=='Fila em dia'
+    kafka['group']['members']=0
+    assert m._transport_activity(kafka)[0]=='Sem consumer ativo'
+    kafka['group']['state']='preparing_rebalancing'
+    assert m._transport_activity(kafka)[0]=='Reorganizando consumidores'
+    kafka['group'].update(state='stable',members=1,lag=None)
+    assert m._transport_activity(kafka)[0]=='Consumo não aferido'
+    kafka['group'].update(lag=1002)
+    title,description,level=m._transport_activity(kafka)
+    assert title=='Aguardando confirmação' and '1.002 mensagens' in description
+    assert level=='warning'
+    kafka['ok']=False
+    assert m._transport_activity(kafka)[0]=='Kafka indisponível'
+
+    snap=m.load_snapshot(now=datetime(2026,10,21,20,tzinfo=timezone.utc),
+        connect=lambda *a,**kw:DB(),kafka_probe=lambda:{'ok':True,'audit_topic':True,
+        'group':{'lag':0,'members':1,'state':'stable'}})
+    assert '<details class="technical">' in m.render_html(snap)
+    snap['latest_cycle']={'status':'failed','error':'connection <details>',
+                          'started_at':'2026-10-22T01:15:00+00:00','finished_at':None}
+    markup=m.render_html(snap)
+    assert 'Última varredura falhou' in markup
+    assert 'connection &lt;details&gt;' in markup and '21/10/2026 às 22:15:00' in markup
+    snap['kafka']['group']['members']=0
+    assert '<details class="technical" open>' in m.render_html(snap)
+
+
 def test_pagination_is_bounded_and_preserves_other_tables():
     pages=m.page_numbers({'tables_page':['2'],'runs_page':['3'],'schema_page':['<script>'],
                           'ranges_page':['999999999999999999999999']})
@@ -214,6 +244,7 @@ if __name__=='__main__':
     for test in (test_coverage,test_alerts_and_unknown,test_end_to_end_snapshot_fake,
                  test_database_read_failure_is_distinct_from_connection_failure,
                  test_explanations_have_unique_accessible_targets_and_preserve_navigation,
+                 test_transport_activity_distinguishes_missing_evidence_from_empty_queue,
                  test_pagination_is_bounded_and_preserves_other_tables,
                  test_permissions_and_protocol):
         test()

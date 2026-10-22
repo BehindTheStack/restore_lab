@@ -8,6 +8,8 @@ from __future__ import annotations
 import html
 import json
 import os
+from pathlib import Path
+import re
 import statistics
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +19,7 @@ from uuid import UUID
 import psycopg
 from confluent_kafka import ConsumerGroupTopicPartitions, TopicPartition
 from confluent_kafka.admin import AdminClient, OffsetSpec
+import monitor_details as details
 
 LOCAL_DSN = os.environ['LOCAL_DSN']
 BOOTSTRAP = os.environ['KAFKA_BOOTSTRAP']
@@ -159,15 +162,15 @@ def _query_catalog_db(conn, now):
         out['table_error_count']=sum(t['status'] in ('error','blocked','inaccessible') for t in tables)
         cur.execute('''SELECT r.run_id::text,t.engine,t.source_schema,t.source_table,r.mode,r.status,
             r.delta_count,r.seen_count,r.inserted_count,r.updated_count,r.deleted_count,
-            r.logical_bytes,r.started_at,r.finished_at,r.error,r.result_generation,t.active_slot
+            r.logical_bytes,r.started_at,r.finished_at,r.error,r.result_generation,t.active_slot,t.table_key
             FROM replica.discovered_runs r JOIN replica.discovered_tables t USING(table_key)
             ORDER BY r.started_at DESC LIMIT 40''')
-        for rid,engine,schema,table,mode,status,delta,seen,ins,upd,deleted,nbytes,start,end,error,generation,slot in cur.fetchall():
+        for rid,engine,schema,table,mode,status,delta,seen,ins,upd,deleted,nbytes,start,end,error,generation,slot,key in cur.fetchall():
             run={'id':rid,'engine':engine,'object':schema+'.'+table,'mode':mode,'status':status,
                  'low':None,'high':None,'delta':delta,'seen':seen,'inserted':ins,'updated':upd,
                  'deleted':deleted,'bytes':nbytes,'started_at':_iso(start),'finished_at':_iso(end),
                  'duration_seconds':round((end-start).total_seconds(),2) if end else None,
-                 'age_seconds':_age(start,now),'error':error,'generation':generation,'slot':slot}
+                 'age_seconds':_age(start,now),'error':error,'generation':generation,'slot':slot,'table_key':key}
             out['recent_runs'].append(run)
         if out['recent_runs']:
             out['latest_run']=out['recent_runs'][0]
@@ -213,7 +216,7 @@ def _query_catalog_db(conn, now):
             WHERE h.id IN(SELECT max(id) FROM replica.discovered_schema_history GROUP BY table_key)
             ORDER BY h.observed_at DESC LIMIT 20''')
         out['catalog']=[{'source':r[5]+'.'+r[6],'engine':r[1],'classification':r[2],
-                         'observed_at':_iso(r[3]),'native_hash':r[4],'logical_hash':r[4]} for r in cur.fetchall()]
+                         'observed_at':_iso(r[3]),'native_hash':r[4],'logical_hash':r[4],'table_key':r[0]} for r in cur.fetchall()]
     return out
 
 
@@ -301,13 +304,13 @@ def _query_db(conn, now):
         out['schema_change']={'status':v[0], 'changed_at':_iso(v[2]),
                               'diff_size':len(v[1]) if isinstance(v[1],list) else None} if v else None
         cur.execute('''SELECT source_key,source_engine,classification,observed_at,
-                            native_hash,logical_hash
+                            native_hash,logical_hash,object_name
                       FROM replica.source_catalog_observations
                       WHERE observation_id IN (
                           SELECT MAX(observation_id) FROM replica.source_catalog_observations
                           GROUP BY source_key)
                       ORDER BY source_key LIMIT 20''')
-        out['catalog']=[{'source':v[0],'engine':v[1],'classification':v[2],
+        out['catalog']=[{'source':v[6],'source_key':v[0],'engine':v[1],'classification':v[2],
                          'observed_at':_iso(v[3]),'native_hash':v[4],
                          'logical_hash':v[5]} for v in cur.fetchall()]
         # Filter to branch ancestry: rolled-back/promoted-away generations do not
@@ -472,7 +475,7 @@ HELP = {
                      'Os dados do slot anterior permanecem disponíveis internamente para rollback compatível.'),
     'table-publication': ('Publicação por tabela', 'A view de cada tabela é ativada em uma transação própria. '
                           'Uma tabela com falha não substitui a geração validada. Consulte o catálogo para ver destino, schema e erros.'),
-    'source': ('Origem remota', 'Banco PostgreSQL ou SQL Server de onde os contratos são lidos. '
+    'source': ('Origem remota', 'Banco PostgreSQL ou SQL Server de onde as tabelas são lidas. '
                'A conta do extrator tem acesso de leitura. “Não sondada” significa que o painel '
                'não testa essa conexão diretamente; ele acompanha as execuções registradas.'),
     'extractor': ('Extração', 'O Python lê a tabela ou a faixa configurada e compara resumos do conteúdo, '
@@ -653,10 +656,21 @@ def _date_time(value):
     return f'<time datetime="{_safe(stamp.isoformat())}" title="Horário de Fortaleza (UTC−03)">{label}</time>'
 
 
-def _detail_value(key, value):
-    if key in ('started_at','finished_at','source_cutoff'):
-        return _date_time(value)
-    return f'<code>{_safe(value)}</code>'
+def _transport_activity(kafka):
+    group=kafka.get('group') or {}
+    if not kafka.get('ok'):
+        return 'Kafka indisponível','O monitor não conseguiu acessar o broker ou o tópico de dados. Consulte os alertas.','bad'
+    if 'rebalanc' in (group.get('state') or '').lower():
+        return 'Reorganizando consumidores','O Kafka está redistribuindo a leitura entre consumers. A confirmação de mensagens pode pausar durante essa transição.','warning'
+    if group.get('members')==0:
+        return 'Sem consumer ativo','Não há processo no grupo para ler novas mensagens. Verifique o serviço consumer.','bad'
+    lag=group.get('lag')
+    if lag is None or group.get('members') is None:
+        return 'Consumo não aferido','Ainda não há informação suficiente sobre o grupo e seus offsets para confirmar o andamento da fila. Consulte os detalhes técnicos.','unknown'
+    if lag==0:
+        return 'Fila em dia','Todas as mensagens até os offsets consultados foram confirmadas pelo consumer após a gravação no destino.','good'
+    pending=f'{lag:,}'.replace(',','.')
+    return 'Aguardando confirmação',f'{pending} mensagens ainda não foram confirmadas. O consumer confirma a leitura após gravar no destino; mensagens incluem dados, presença e controle.',('warning' if lag>MAX_LAG else 'unknown')
 
 
 def render_html(s, pages=None):
@@ -685,9 +699,37 @@ def render_html(s, pages=None):
     cover_txt=f"{c['ratio']:.2f}%" if c.get('ratio') is not None else 'Não aferida'
     cover_state='good' if c.get('status')=='complete' else 'unknown'
     sc_state=('warning' if s.get('table_error_count') else 'good') if automatic else ('warning' if schema.get('pending_hash') else ('good' if schema.get('active_hash') else 'unknown'))
-    row_html=''.join(f'''<tr><td><a href="/run/{_safe(r['id'])}"><code>{_safe(r['id'][:8])}</code></a></td>
+    latest=runs[0] if runs else {}
+    source_label,source_desc,source_level={
+        'promoted':('Último lote publicado','A leitura foi concluída e os dados desse lote foram validados e publicados no destino.','good'),
+        'extracting':('Leitura ainda sem conclusão','O extrator registrou uma leitura da origem. Confira o horário e as evidências se ela demorar a concluir.','unknown'),
+        'loading':('Lote ainda sem conclusão','Há um lote aguardando conclusão da leitura ou validação pelo consumer. Confira o horário e as evidências.','unknown'),
+        'failed':('Última tentativa falhou','A leitura ou o envio desse lote falhou. Consulte o erro e as evidências antes de tentar novamente.','bad'),
+        'rejected':('Último lote rejeitado','O consumer recusou a publicação desse lote; os dados publicados anteriormente foram preservados.','warning'),
+        'aborted':('Último lote interrompido','A execução terminou sem publicar esse lote. Consulte o erro e as evidências.','warning'),
+    }.get(latest.get('status'),('Nenhuma leitura registrada','Aguarde a inicialização ou consulte os alertas e o scheduler.','unknown'))
+    source_error=latest.get('error')
+    source_at=latest.get('finished_at') or latest.get('started_at')
+    source_when='Concluído em' if latest.get('finished_at') else 'Iniciado em'
+    cycle=s.get('latest_cycle') or {}
+    if cycle.get('status')=='failed':
+        source_label,source_desc,source_level='Última varredura falhou','O ciclo não foi concluído. Consulte o erro do ciclo e os alertas.','bad'
+        source_error=cycle.get('error')
+        source_at=cycle.get('finished_at') or cycle.get('started_at')
+        source_when='Ciclo registrado em'
+    if not s['local_db']['ok']:
+        source_label,source_desc,source_level='Histórico indisponível','O monitor não conseguiu consultar as execuções locais. Verifique o alerta do PostgreSQL local.','unknown'
+    engine={'postgresql':'PostgreSQL','sqlserver':'SQL Server'}.get(latest.get('engine'),latest.get('engine') or 'Origem não informada')
+    source_context=(f'<p>{_safe(engine)}'+(' · '+details.table_link({'id':latest['id']},latest['object']) if latest.get('object') else '')+'</p>') if latest else ''
+    source_evidence=('<p>'+details.modal_link('/run/'+latest['id'],'Ver evidências do lote '+latest['id'][:8])+'</p>') if latest else ''
+    source_time=(f'<p class="subtle">{source_when}: {_date_time(source_at)}</p>') if source_at else ''
+    transport_label,transport_desc,transport_level=_transport_activity(k)
+    transport_error=k.get('error') or k.get('group_error')
+    technical_open=' open' if (transport_level=='bad' or transport_error or
+        (group.get('lag') is not None and group['lag']>MAX_LAG) or not k.get('audit_topic')) else ''
+    row_html=''.join(f'''<tr><td>{details.modal_link('/run/'+r['id'],r['id'][:8],code=True)}</td>
         <td class="run-date">{_date_time(r.get('started_at'))}</td>
-        <td>{_safe((r.get('object')+' · ' if r.get('object') else '')+str(r['engine']))}</td><td>{_safe(r['mode'])}</td>
+        <td>{(details.table_link({'id':r['id']},r['object'])+' · ') if r.get('object') else ''}{_safe(r['engine'])}</td><td>{_safe(r['mode'])}</td>
         <td>{_safe(str(r['low'])+'–'+str(r['high']) if r['low'] is not None else 'tabela inteira' if automatic else 'bootstrap')}</td>
         <td><span class="tag">{_safe(r['status'])}</span></td>
         <td>{_safe(r['delta'])}</td><td>{_safe(r['deleted'])}</td>
@@ -696,11 +738,11 @@ def render_html(s, pages=None):
     alert_html=''.join(f'''<div class="alert {('critical' if x['severity']=='critical' else 'warning')}">
          <b>{_safe(x['code'])}</b><span>{_safe(x['message'])}</span>
          <small>{_safe(x['action'])}</small></div>''' for x in s['alarms'])
-    ranges=''.join(f'''<tr><td><a href="/run/{_safe(x['run_id'])}">{_safe(x['run_id'][:8])}</a></td>
+    ranges=''.join(f'''<tr><td>{details.modal_link('/run/'+x['run_id'],x['run_id'][:8])}</td>
         <td>{_safe(x['engine'])}</td><td>{_safe(x['low'])}–{_safe(x['high'])}</td>
         <td>{_safe(x['target_max_id'])}</td><td>{_date_time(x['at'])}</td></tr>'''
         for x in page_ranges)
-    catalogs=''.join(f'<tr><td>{_safe(x["source"])}</td><td>{_safe(x["engine"])}</td>'
+    catalogs=''.join(f'<tr><td>{details.table_link(x,x["source"])}</td><td>{_safe(x["engine"])}</td>'
         f'<td>{_safe(x["classification"])}</td><td>{_date_time(x["observed_at"])}</td></tr>'
         for x in page_catalog)
     gaps=', '.join(f'{lo}–{hi}' for lo,hi in c.get('gaps',[])) or '—'
@@ -738,7 +780,7 @@ def render_html(s, pages=None):
         _summary_card('Alterações promovidas (24h)',
                       (m.get('inserted_24h') or 0)+(m.get('updated_24h') or 0)+(m.get('deleted_24h') or 0),
                       'INSERT + UPDATE + DELETE','changes')])
-    table_rows=''.join(f'''<tr><td>{_safe(t['engine'])} · {_safe(t['schema'])}.{_safe(t['table'])}</td>
+    table_rows=''.join(f'''<tr><td>{_safe(t['engine'])} · {details.table_link(t,t['schema']+'.'+t['table'])}</td>
         <td><code>{_safe(t['destination_schema'])}.{_safe(t['destination_table'])}</code></td>
         <td>{_safe(t['status'])}</td><td>{_safe(t['rows'])}</td><td>{_safe(t['generation'])} · {_safe(t['slot'])}</td>
         <td><code>{_safe((t['schema_hash'] or '')[:12])}</code></td><td>{_date_time(t['checked_at'])}</td>
@@ -764,7 +806,8 @@ def render_html(s, pages=None):
         '</tbody></table></div>'+ranges_nav+'</section>') if not automatic else ''
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="20"><title>Reconciliação · Saúde ponta a ponta</title>
+<noscript><meta http-equiv="refresh" content="20"></noscript><title>Reconciliação · Saúde ponta a ponta</title>
+<script src="/monitor.js" defer></script>
 <style>
 :root{{--bg:#f5f7fa;--paper:#fff;--ink:#182638;--muted:#657589;--line:#e1e6ed;--link:#215ca6}}
 *{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--bg);font:14px system-ui,Arial,sans-serif;color:var(--ink)}}
@@ -812,6 +855,19 @@ h1{{font-size:27px;margin:3px 0 7px}}h2{{font-size:17px;margin:0 0 13px}}p{{colo
 .pagination [aria-current]{{background:#edf2f8;color:var(--ink)}}.pagination a:focus-visible{{outline:2px solid var(--link);outline-offset:2px}}
 th,td{{border-bottom:1px solid var(--line);padding:11px 9px;vertical-align:top;font-size:12px}}th{{color:var(--muted);font-weight:600}}
 .run-date{{white-space:nowrap;font-variant-numeric:tabular-nums}}
+.activity-state{{font-size:16px;font-weight:700;line-height:1.5;margin:8px 0}}
+.activity-state.good{{color:#207653}}.activity-state.warning{{color:#946318}}.activity-state.bad{{color:#b63743}}.activity-state.unknown{{color:var(--muted)}}
+.technical{{border-top:1px solid var(--line);padding-top:12px;margin-top:14px}}
+.technical summary{{cursor:pointer;color:var(--link);font-size:12px;font-weight:600}}
+.technical summary:focus-visible{{outline:2px solid var(--link);outline-offset:3px}}
+.technical .facts{{margin:16px 0}}.technical[open] summary{{margin-bottom:10px}}
+.details-modal{{width:min(980px,calc(100vw - 32px));max-height:calc(100dvh - 48px);padding:0;border:1px solid var(--line);border-radius:13px;color:var(--ink);background:var(--paper);box-shadow:0 20px 80px #18263840}}
+.details-modal::backdrop{{background:#18263899}}.modal-header{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:18px 22px;border-bottom:1px solid var(--line)}}
+.modal-header h2{{margin:0;overflow-wrap:anywhere}}.modal-actions{{display:flex;gap:8px;flex-shrink:0}}
+.modal-actions button{{font:600 12px system-ui;padding:7px 12px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--link);cursor:pointer}}
+.modal-actions button:focus-visible,a[data-modal]:focus-visible{{outline:2px solid var(--link);outline-offset:3px}}
+.modal-content{{padding:6px 22px 22px;overflow:auto;max-height:calc(100dvh - 140px)}}
+{details.DETAIL_CSS}
 .tag{{border-radius:8px;background:#edf2f8;padding:4px 7px}}.alert{{border:1px solid #edcf98;border-radius:9px;padding:10px 12px;margin:8px 0;background:#fffaf0}}
 .alert.critical{{border-color:#e9a1a5;background:#fff3f4}}.alert span{{display:block;margin:5px 0}}.alert small{{color:var(--muted)}}
 code{{font:12px ui-monospace,monospace}}.meter{{height:10px;background:#e7edf3;border-radius:20px;margin:14px 0;overflow:hidden}}
@@ -847,17 +903,22 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 <div class="meter"><div style="width:{max(0,min(100,c.get('ratio') or 0))}%"></div></div>
 <p>Estado: <b>{_safe(c.get('status'))}</b> · Primeiras lacunas: {_safe(gaps)}.</p>
 <p class="subtle">{'Proporção de tabelas com leitura completa validada na janela. Cada tabela usa sua própria transação; 100% não garante igualdade simultânea de toda a origem.' if automatic else 'Usamos união de faixas promovidas pertencentes à linhagem ativa. Isso não mede quantidade de contratos, volume trafegado ou consistência transacional de todo o remoto. Sem meta de cobertura, não há SLO de 100%.'}</p></section></div>
-<div class="columns"><section class="section" id="source"><h2>Origem e extração</h2>
-<p><b>Conectividade atual da origem: não aferida.</b> O painel não usa credenciais remotas nem aumenta carga no servidor.</p>
-<p>Último lote: {_safe((runs[0] or {}).get('status') if runs else None)} · Origem: {_safe((runs[0] or {}).get('engine') if runs else None)}</p>
-<p>Uma queda antes de criar um lote não aparece como falha da origem. Monitoramos as execuções conhecidas, não uptime real.</p>
-</section><section class="section" id="kafka"><h2>Transporte e consumidor Kafka</h2>
-<div class="facts">{_fact('Brokers',k.get('brokers'),'brokers')}
+<div class="columns"><section class="section" id="source"><h2>Última atividade da extração</h2>
+<div class="activity-state {source_level} has-help">{_safe(source_label)}{_help('source','activity-source')}</div>
+<p>{_safe(source_desc)}</p>
+{source_context}{source_time}{source_evidence}
+{('<p class="alert critical">'+_safe(source_error)+'</p>') if source_error else ''}
+</section><section class="section" id="kafka"><h2>Entrega das mensagens</h2>
+<div class="activity-state {transport_level} has-help">{_safe(transport_label)}{_help('consumer','activity-transport')}</div>
+<p>{_safe(transport_desc)}</p>
+{('<p class="alert critical">'+_safe(transport_error)+'</p>') if transport_error else ''}
+<details class="technical"{technical_open}><summary>Detalhes técnicos do Kafka</summary>
+<div class="facts">{_fact('Servidores Kafka',k.get('brokers'),'brokers')}
 {_fact('Partições',k.get('partitions'),'partitions')}
-{_fact('Membros do grupo',group.get('members'),'members')}
-{_fact('Consumer lag',group.get('lag'),'lag')}</div>
-<p>Dados: {'acessível' if k.get('data_topic') else 'indisponível'} · Auditoria: {'acessível' if k.get('audit_topic') else 'não encontrada'} · Grupo: {_safe(group.get('state'))}</p>
-<p class="subtle">{_safe(k.get('error') or k.get('group_error'))}</p>
+{_fact('Consumers no grupo',group.get('members'),'members')}</div>
+<p class="subtle">Tópico de dados: {'acessível' if k.get('data_topic') else 'indisponível'} · Auditoria Kafka: {'acessível' if k.get('audit_topic') else 'não encontrada'}</p>
+<p class="subtle">Grupo: <code>{_safe(group.get('name') or GROUP)}</code> · Estado interno: <code>{_safe(group.get('state'))}</code></p>
+</details>
 </section></div>
 <div class="columns"><section class="section" id="destination"><h2>Destino e blue-green</h2>
 {('<p class="alert critical">' + _safe(s['local_db'].get('error')) + '</p>') if s['local_db'].get('error') else ''}
@@ -886,7 +947,13 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 <a href="/status.json">JSON de saúde</a><a href="/readyz">Readiness</a>
 <p>Indicadores operacionais calculados sobre evidências locais e metadados Kafka. Sem sonda ativa à origem,
 sem instrumentação extra, sem alterações de dados pelo painel e sem promessa de igualdade global entre as bases.</p></footer>
-</main></body></html>'''
+</main>
+<dialog id="details-modal" class="details-modal" aria-labelledby="modal-title">
+<div class="modal-header"><h2 id="modal-title">Detalhes</h2><div class="modal-actions">
+<button id="modal-back" type="button" hidden>Voltar</button>
+<button id="modal-close" type="button" autofocus>Fechar</button></div></div>
+<div id="modal-content" class="modal-content" aria-busy="false" tabindex="0"></div>
+</dialog></body></html>'''
 
 
 def run_details(rid, connect=psycopg.connect):
@@ -922,27 +989,79 @@ def run_details(rid, connect=psycopg.connect):
             return {key:_iso(value) for key,value in zip(keys,v)}
 
 
+def ddl_details(query, connect=psycopg.connect):
+    selectors=[key for key in ('table_key','source_key','run_id') if key in query]
+    if len(selectors)!=1 or len(query[selectors[0]])!=1:
+        raise ValueError('Specify one table or execution')
+    key=selectors[0]
+    value=query[key][0]
+    if key=='table_key' and not re.fullmatch('[0-9a-f]{64}',value):
+        raise ValueError('Invalid table key')
+    if key=='run_id':
+        value=str(UUID(value))
+    if key=='source_key' and (not value or len(value)>200 or '\x00' in value):
+        raise ValueError('Invalid source key')
+    with connect(LOCAL_DSN,connect_timeout=3) as conn:
+        with conn.cursor() as cur:
+            if key=='table_key':
+                cur.execute('''SELECT observed_manifest,observed_at,status FROM replica.discovered_tables
+                               WHERE table_key=%s''',(value,))
+            elif key=='source_key':
+                cur.execute('''SELECT native_manifest,observed_at,classification
+                               FROM replica.source_catalog_observations WHERE source_key=%s
+                               ORDER BY observation_id DESC LIMIT 1''',(value,))
+            elif SYNC_MODE=='catalog':
+                cur.execute('''SELECT manifest,started_at,status FROM replica.discovered_runs
+                               WHERE run_id=%s''',(value,))
+            else:
+                cur.execute('''SELECT v.manifest,r.started_at,r.status FROM replica.sync_runs r
+                               JOIN replica.schema_versions v ON v.schema_hash=r.data_schema_hash
+                               WHERE r.run_id=%s AND r.source_engine='postgresql' ''',(value,))
+            row=cur.fetchone()
+            if not row or not row[0] or not row[0].get('columns'):
+                return None
+            record={'manifest':row[0],'observed_at':_iso(row[1]),'status':row[2]}
+            if key=='run_id':
+                record['run_id']=value
+            return record
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path=urlparse(self.path).path
-        if not (path in ('/','/status.json','/healthz','/readyz') or path.startswith('/run/')):
+        if not (path in ('/','/status.json','/healthz','/readyz','/ddl','/monitor.js') or path.startswith('/run/')):
             self.send_error(404);return
         try:
+            try:
+                query=parse_qs(urlparse(self.path).query,max_num_fields=20)
+            except ValueError:
+                self.send_error(400,'Invalid query');return
+            if path=='/monitor.js':
+                self._send(200,'text/javascript; charset=utf-8',Path(__file__).with_name('monitor_ui.js').read_text());return
             if path=='/healthz':
                 self._send(200,'application/json',json.dumps({'monitor_alive':True}));return
-            if path.startswith('/run/'):
+            if path.startswith('/run/') or path=='/ddl':
                 try:
-                    data=run_details(path.split('/')[-1])
+                    data=ddl_details(query) if path=='/ddl' else run_details(path.split('/')[-1])
                 except ValueError:
-                    self.send_error(400,'Invalid UUID');return
-                if data is None:self.send_error(404,'Run not found');return
-                obj='<h1>Execução '+_safe(data['run_id'])+'</h1><p><a href="/">← Painel</a></p>'
-                obj+='<table>'+''.join(f'<tr><th>{_safe(key)}</th><td>{_detail_value(key,val)}</td></tr>' for key,val in data.items())+'</table>'
-                body='<!doctype html><html lang="pt-BR"><meta charset="utf-8"><title>Execução</title><body style="font:14px system-ui;max-width:900px;margin:30px auto">'+obj+'</body></html>'
-                self._send(200,'text/html; charset=utf-8',body);return
+                    self.send_error(400,'Invalid identifier');return
+                if data is None:self.send_error(404,'Details not found');return
+                if path=='/ddl':
+                    manifest=data['manifest']
+                    name=(manifest['schema']+'.' if manifest.get('schema') else '')+manifest['table']
+                    title='DDL de '+name
+                    body=details.ddl_body(data,_date_time)
+                else:
+                    title='Execução '+data['run_id'][:8]
+                    body=details.run_body(data,_date_time)
+                if query.get('format')==['json']:
+                    self._send(200,'application/json; charset=utf-8',json.dumps({'title':title,'html':body},ensure_ascii=False))
+                else:
+                    self._send(200,'text/html; charset=utf-8',details.detail_page(title,body))
+                return
             snapshot=load_snapshot()
             if path=='/':
-                pages=page_numbers(parse_qs(urlparse(self.path).query,max_num_fields=20))
+                pages=page_numbers(query)
                 self._send(200,'text/html; charset=utf-8',render_html(snapshot,pages))
             elif path=='/status.json':
                 self._send(200,'application/json; charset=utf-8',json.dumps(snapshot,ensure_ascii=False,default=str))
@@ -959,7 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length',str(len(raw)))
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff')
-        self.send_header('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'")
+        self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
         self.end_headers();self.wfile.write(raw)
     def log_message(self,fmt,*args):pass
 
