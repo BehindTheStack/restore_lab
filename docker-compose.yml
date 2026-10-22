@@ -3,10 +3,10 @@ services:
   remote-db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_PASSWORD: lab-admin
+      POSTGRES_PASSWORD: "${REMOTE_ADMIN_PASSWORD:-lab-admin}"
       POSTGRES_DB: lab_remote
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${REMOTE_DB_HOST_PORT:-55432}:5432"
     volumes:
       - remote_data:/var/lib/postgresql/data
       - ./sql/remote.sql:/docker-entrypoint-initdb.d/01-remote.sql:ro
@@ -23,9 +23,9 @@ services:
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_PID: Developer
-      MSSQL_SA_PASSWORD: "Lab-Strong-Pass-2026!"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Lab-Strong-Pass-2026!}"
     ports:
-      - "127.0.0.1:51433:1433"
+      - "127.0.0.1:${MSSQL_HOST_PORT:-51433}:1433"
     volumes:
       - mssql_data:/var/opt/mssql
 
@@ -37,17 +37,17 @@ services:
     command: ["init"]
     environment:
       MSSQL_HOST: remote-sqlserver
-      MSSQL_SA_PASSWORD: "Lab-Strong-Pass-2026!"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Lab-Strong-Pass-2026!}"
     depends_on:
       - remote-sqlserver
 
   local-db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_PASSWORD: lab-admin
+      POSTGRES_PASSWORD: "${LOCAL_ADMIN_PASSWORD:-lab-admin}"
       POSTGRES_DB: lab_local
     ports:
-      - "127.0.0.1:55433:5432"
+      - "127.0.0.1:${LOCAL_DB_HOST_PORT:-55433}:5432"
     volumes:
       - local_data:/var/lib/postgresql/data
       - ./sql/local.sql:/docker-entrypoint-initdb.d/01-local.sql:ro
@@ -61,13 +61,13 @@ services:
     image: apache/kafka:4.2.2
     hostname: kafka
     ports:
-      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9092}:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
       KAFKA_LISTENERS: 'CONTROLLER://:29093,EXTERNAL://:9092,INTERNAL://:19092'
-      KAFKA_ADVERTISED_LISTENERS: 'EXTERNAL://localhost:9092,INTERNAL://kafka:19092'
+      KAFKA_ADVERTISED_LISTENERS: 'EXTERNAL://localhost:${KAFKA_HOST_PORT:-9092},INTERNAL://kafka:19092'
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT'
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -83,7 +83,7 @@ services:
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.13.0
     ports:
-      - "127.0.0.1:8474:8474"
+      - "127.0.0.1:${TOXIPROXY_HOST_PORT:-8474}:8474"
     depends_on:
       remote-db:
         condition: service_healthy
@@ -92,14 +92,15 @@ services:
     build: ./app
     image: *app-image
     environment: &app-env
-      REMOTE_DSN: "host=toxiproxy port=15432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
-      REMOTE_DIRECT_DSN: "host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
-      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=postgres password=lab-admin connect_timeout=4"
-      KAFKA_BOOTSTRAP: kafka:19092
-      KAFKA_TOPIC: lab.sync.events
-      KAFKA_AUDIT_TOPIC: lab.sync.audit
-      MAX_REMOVE_FRACTION: "0.20"
-      TOXIPROXY_URL: http://toxiproxy:8474
+      REMOTE_DSN: "${REMOTE_DSN:-host=toxiproxy port=15432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4}"
+      REMOTE_DIRECT_DSN: "${REMOTE_DIRECT_DSN:-host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4}"
+      LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=postgres password=${LOCAL_ADMIN_PASSWORD:-lab-admin} connect_timeout=4"
+      KAFKA_BOOTSTRAP: "${KAFKA_BOOTSTRAP:-kafka:19092}"
+      KAFKA_TOPIC: "${KAFKA_TOPIC:-lab.sync.events}"
+      KAFKA_AUDIT_TOPIC: "${KAFKA_AUDIT_TOPIC:-lab.sync.audit}"
+      MAX_REMOVE_FRACTION: "${MAX_REMOVE_FRACTION:-0.20}"
+      SOURCE_SCHEMAS: "${SOURCE_SCHEMAS:-}"
+      TOXIPROXY_URL: "${TOXIPROXY_URL:-http://toxiproxy:8474}"
     command: ["consume"]
     restart: unless-stopped
     depends_on:
@@ -115,11 +116,11 @@ services:
     environment:
       <<: *app-env
       REMOTE_ENGINE: sqlserver
-      MSSQL_HOST: toxiproxy
-      MSSQL_PORT: "15433"
-      MSSQL_USER: remote_reader
-      MSSQL_PASSWORD: lab-reader
-      MSSQL_DATABASE: lab_remote
+      MSSQL_HOST: "${MSSQL_HOST:-toxiproxy}"
+      MSSQL_PORT: "${MSSQL_PORT:-15433}"
+      MSSQL_USER: "${MSSQL_USER:-remote_reader}"
+      MSSQL_PASSWORD: "${MSSQL_PASSWORD:-lab-reader}"
+      MSSQL_DATABASE: "${MSSQL_DATABASE:-lab_remote}"
     depends_on:
       local-db:
         condition: service_healthy
@@ -137,12 +138,12 @@ services:
     environment:
       <<: *app-env
       REMOTE_ENGINE: sqlserver
-      MSSQL_HOST: toxiproxy
-      MSSQL_PORT: "15433"
-      MSSQL_USER: remote_reader
-      MSSQL_PASSWORD: lab-reader
-      MSSQL_DATABASE: lab_remote
-    command: ["discover", "schedule", "--interval", "60"]
+      MSSQL_HOST: "${MSSQL_HOST:-toxiproxy}"
+      MSSQL_PORT: "${MSSQL_PORT:-15433}"
+      MSSQL_USER: "${MSSQL_USER:-remote_reader}"
+      MSSQL_PASSWORD: "${MSSQL_PASSWORD:-lab-reader}"
+      MSSQL_DATABASE: "${MSSQL_DATABASE:-lab_remote}"
+    command: ["discover", "schedule", "--interval", "${SCHEDULER_INTERVAL_SECONDS:-60}"]
     restart: unless-stopped
     stop_grace_period: 10m
     depends_on:
@@ -172,7 +173,7 @@ services:
     environment:
       <<: *app-env
       # ADMIN only in this synthetic fixture service; not in producer/consumer.
-      REMOTE_ADMIN_DSN: "host=remote-db port=5432 dbname=lab_remote user=postgres password=lab-admin connect_timeout=4"
+      REMOTE_ADMIN_DSN: "host=remote-db port=5432 dbname=lab_remote user=postgres password=${REMOTE_ADMIN_PASSWORD:-lab-admin} connect_timeout=4"
     command: ["seed"]
     depends_on:
       remote-db:
@@ -182,7 +183,7 @@ services:
     build: ./app
     image: *app-image
     environment: *app-env
-    command: ["discover", "init", "--promotion-timeout", "600"]
+    command: ["discover", "init", "--promotion-timeout", "${INIT_PROMOTION_TIMEOUT_SECONDS:-600}"]
     restart: "no"
     depends_on:
       remote-db:
@@ -201,7 +202,7 @@ services:
     image: *app-image
     init: true
     environment: *app-env
-    command: ["discover", "schedule", "--interval", "60"]
+    command: ["discover", "schedule", "--interval", "${SCHEDULER_INTERVAL_SECONDS:-60}"]
     restart: unless-stopped
     stop_grace_period: 10m
     depends_on:
@@ -218,7 +219,7 @@ services:
   monitor-db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_PASSWORD: monitor-admin
+      POSTGRES_PASSWORD: "${MONITOR_ADMIN_PASSWORD:-monitor-admin}"
       POSTGRES_DB: lab_monitor
     volumes:
       - monitor_data:/var/lib/postgresql/data
@@ -237,12 +238,12 @@ services:
     environment:
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
       MONITOR_WRITE_DSN: "host=monitor-db port=5432 dbname=lab_monitor user=monitor_writer password=monitor-writer connect_timeout=3"
-      KAFKA_BOOTSTRAP: kafka:19092
-      LAB_SYNC_MODE: catalog
-      LAB_STALLED_MINUTES: "15"
-      LAB_COVERAGE_WINDOW_HOURS: "24"
-      LAB_MAX_COVERAGE_INTERVALS: "20000"
-      LAB_MONITOR_COLLECTION_SECONDS: "10"
+      KAFKA_BOOTSTRAP: "${KAFKA_BOOTSTRAP:-kafka:19092}"
+      LAB_SYNC_MODE: "${LAB_SYNC_MODE:-catalog}"
+      LAB_STALLED_MINUTES: "${LAB_STALLED_MINUTES:-15}"
+      LAB_COVERAGE_WINDOW_HOURS: "${LAB_COVERAGE_WINDOW_HOURS:-24}"
+      LAB_MAX_COVERAGE_INTERVALS: "${LAB_MAX_COVERAGE_INTERVALS:-20000}"
+      LAB_MONITOR_COLLECTION_SECONDS: "${LAB_MONITOR_COLLECTION_SECONDS:-10}"
     depends_on:
       local-db:
         condition: service_started
@@ -257,20 +258,20 @@ services:
     entrypoint: ["python", "-u", "/app/monitor.py"]
     environment:
       MONITOR_DSN: "host=monitor-db port=5432 dbname=lab_monitor user=monitor_reader password=monitor-reader connect_timeout=3"
-      KAFKA_BOOTSTRAP: kafka:19092
-      KAFKA_TOPIC: lab.sync.events
-      KAFKA_AUDIT_TOPIC: lab.sync.audit
+      KAFKA_BOOTSTRAP: "${KAFKA_BOOTSTRAP:-kafka:19092}"
+      KAFKA_TOPIC: "${KAFKA_TOPIC:-lab.sync.events}"
+      KAFKA_AUDIT_TOPIC: "${KAFKA_AUDIT_TOPIC:-lab.sync.audit}"
       LAB_CONSUMER_GROUP: lab-range-bluegreen-v4
-      LAB_SYNC_MODE: catalog
-      LAB_STALLED_MINUTES: "15"
-      LAB_COVERAGE_WINDOW_HOURS: "24"
-      LAB_MAX_COVERAGE_INTERVALS: "20000"
-      LAB_EXPECTED_INTERVAL_MINUTES: "0" # optional freshness alert; 0 disables it
-      LAB_MAX_CONSUMER_LAG: "1000"
+      LAB_SYNC_MODE: "${LAB_SYNC_MODE:-catalog}"
+      LAB_STALLED_MINUTES: "${LAB_STALLED_MINUTES:-15}"
+      LAB_COVERAGE_WINDOW_HOURS: "${LAB_COVERAGE_WINDOW_HOURS:-24}"
+      LAB_MAX_COVERAGE_INTERVALS: "${LAB_MAX_COVERAGE_INTERVALS:-20000}"
+      LAB_EXPECTED_INTERVAL_MINUTES: "${LAB_EXPECTED_INTERVAL_MINUTES:-0}" # optional freshness alert; 0 disables it
+      LAB_MAX_CONSUMER_LAG: "${LAB_MAX_CONSUMER_LAG:-1000}"
       LAB_MONITOR_PORT: "8082"
-      LAB_MONITOR_COLLECTION_MAX_AGE: "60"
+      LAB_MONITOR_COLLECTION_MAX_AGE: "${LAB_MONITOR_COLLECTION_MAX_AGE:-60}"
     ports:
-      - "127.0.0.1:8082:8082"
+      - "127.0.0.1:${MONITOR_HOST_PORT:-8082}:8082"
     depends_on:
       monitor-db:
         condition: service_healthy
@@ -289,10 +290,10 @@ services:
   kafbat:
     image: kafbat/kafka-ui:v1.5.0
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${KAFBAT_HOST_PORT:-8080}:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: kafka-lab
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "${KAFKA_BOOTSTRAP:-kafka:19092}"
       DYNAMIC_CONFIG_ENABLED: 'true'
     depends_on:
       - kafka
@@ -300,7 +301,7 @@ services:
   adminer:
     image: adminer:5
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:${ADMINER_HOST_PORT:-8081}:8080"
     environment:
       ADMINER_DEFAULT_SERVER: local-db
     depends_on:

@@ -1,4 +1,18 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Configuração local e credenciais; os modelos permanecem versionáveis.
 .env
+.env.*
+!.env.example
+!.env.local.example
+
 *.log
+.vscode/
