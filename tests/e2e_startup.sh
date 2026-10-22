@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Creates and removes only its own disposable projects; publishes no host ports.
+# Compatibility test of the original single-table startup; publishes no host ports.
 set -euo pipefail
 if [[ "${LAB_STARTUP_TEST:-0}" != "1" ]]; then
   echo 'Run LAB_STARTUP_TEST=1 bash tests/e2e_startup.sh for isolated startup tests.' >&2
@@ -38,11 +38,14 @@ services:
     image: $startup_base-app
   init:
     image: $startup_base-app
+    command: ["initialize", "--promotion-timeout", "600"]
   scheduler:
     image: $startup_base-app
     command: ["schedule", "--interval", "2", "--sweep-width", "1000"]
   monitor:
     image: $startup_base-app
+    environment:
+      LAB_SYNC_MODE: legacy
     ports: !reset []
 YAML
 

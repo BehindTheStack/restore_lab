@@ -31,6 +31,7 @@ services:
 
   mssql-fixture:
     build: ./app
+    image: &app-image kafka-restore-lab-app
     profiles: ["mssql-tools"]
     entrypoint: ["python", "-u", "/app/sqlserver_fixture.py"]
     command: ["init"]
@@ -89,6 +90,7 @@ services:
 
   consumer:
     build: ./app
+    image: *app-image
     environment: &app-env
       REMOTE_DSN: "host=toxiproxy port=15432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
       REMOTE_DIRECT_DSN: "host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4"
@@ -108,6 +110,7 @@ services:
 
   mssql-cli:
     build: ./app
+    image: *app-image
     profiles: ["mssql-tools"]
     environment:
       <<: *app-env
@@ -124,10 +127,12 @@ services:
         condition: service_started
       toxiproxy:
         condition: service_started
-    command: ["catalog", "observe", "--engine", "sqlserver", "--source-key", "mssql-dbo-contracts"]
+    command: ["discover", "status"]
 
   mssql-scheduler:
     build: ./app
+    image: *app-image
+    init: true
     profiles: ["mssql-scheduled"]
     environment:
       <<: *app-env
@@ -137,7 +142,7 @@ services:
       MSSQL_USER: remote_reader
       MSSQL_PASSWORD: lab-reader
       MSSQL_DATABASE: lab_remote
-    command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
+    command: ["discover", "schedule", "--interval", "60"]
     restart: unless-stopped
     stop_grace_period: 10m
     depends_on:
@@ -148,6 +153,7 @@ services:
 
   cli:
     build: ./app
+    image: *app-image
     environment: *app-env
     profiles: ["tools"]
     depends_on:
@@ -157,10 +163,11 @@ services:
         condition: service_started
       toxiproxy:
         condition: service_started
-    command: ["status"]
+    command: ["discover", "status"]
 
   seed-fixture:
     build: ./app
+    image: *app-image
     profiles: ["tools"]
     environment:
       <<: *app-env
@@ -173,8 +180,9 @@ services:
 
   init:
     build: ./app
+    image: *app-image
     environment: *app-env
-    command: ["initialize", "--ready-timeout", "60", "--promotion-timeout", "600"]
+    command: ["discover", "init", "--promotion-timeout", "600"]
     restart: "no"
     depends_on:
       remote-db:
@@ -190,8 +198,10 @@ services:
 
   scheduler:
     build: ./app
+    image: *app-image
+    init: true
     environment: *app-env
-    command: ["schedule", "--interval", "60", "--sweep-width", "1000"]
+    command: ["discover", "schedule", "--interval", "60"]
     restart: unless-stopped
     stop_grace_period: 10m
     depends_on:
@@ -207,6 +217,7 @@ services:
   # Read-only end-to-end operations UI, included in the default stack.
   monitor:
     build: ./app
+    image: *app-image
     entrypoint: ["python", "-u", "/app/monitor.py"]
     environment:
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
@@ -214,6 +225,7 @@ services:
       KAFKA_TOPIC: lab.sync.events.v6
       KAFKA_AUDIT_TOPIC: lab.sync.audit.v6
       LAB_CONSUMER_GROUP: lab-range-bluegreen-v4
+      LAB_SYNC_MODE: catalog
       LAB_STALLED_MINUTES: "15"
       LAB_COVERAGE_WINDOW_HOURS: "24"
       LAB_MAX_COVERAGE_INTERVALS: "20000"

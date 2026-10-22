@@ -200,7 +200,7 @@ class StartupTest(unittest.TestCase):
         services = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())['services']
         for name in ('init', 'scheduler', 'monitor'):
             self.assertNotIn('profiles', services[name])
-        self.assertEqual(services['init']['command'][0], 'initialize')
+        self.assertEqual(services['init']['command'][:2], ['discover','init'])
         self.assertEqual(services['init']['restart'], 'no')
         self.assertEqual(services['scheduler']['depends_on']['init']['condition'],
                          'service_completed_successfully')

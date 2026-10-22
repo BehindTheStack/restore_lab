@@ -15,4 +15,6 @@ CREATE ROLE remote_reader LOGIN PASSWORD 'lab-reader';
 GRANT CONNECT ON DATABASE lab_remote TO remote_reader;
 GRANT USAGE ON SCHEMA public TO remote_reader;
 GRANT SELECT ON public.contracts TO remote_reader;
+-- Fixture administrator only: future lab tables are readable without granting writes.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO remote_reader;
 ALTER ROLE remote_reader SET default_transaction_read_only = on;

@@ -692,8 +692,14 @@ def on_end(conn, evt):
 
 
 def handle_event(conn, event):
-    run_id = event['run_id']
     kind = event['kind']
+    if kind.startswith('table_'):
+        if event.get('schema_version') != SCHEMA:
+            raise RuntimeError('Unknown multi-table event protocol')
+        import discovery_store
+        discovery_store.handle(conn,event)
+        return
+    run_id = event['run_id']
     if kind.startswith('schema_backfill_'):
         if event.get('schema_version')!=SCHEMA:
             raise RuntimeError('Unknown schema-backfill protocol version')
@@ -774,6 +780,9 @@ def handle_event(conn, event):
 
 
 def consume():
+    import discovery_store
+    with psycopg.connect(LOCAL,autocommit=True) as local:
+        discovery_store.ensure_schema(local)
     kafka_ready()
     while True:
         c = Consumer({'bootstrap.servers': BROKER,
@@ -1131,6 +1140,21 @@ def main():
     incremental.add_argument('--throttle-ms', type=int, default=0)
     sub.add_parser('consume')
     sub.add_parser('status')
+    discovery=sub.add_parser('discover',help='Discover and reconcile all SELECT-accessible source tables')
+    discovery_sub=discovery.add_subparsers(dest='discovery_command',required=True)
+    for name in ('init','once','schedule'):
+        cmd=discovery_sub.add_parser(name)
+        cmd.add_argument('--promotion-timeout',type=int,default=600)
+        cmd.add_argument('--batch-size',type=int,default=250)
+        if name=='schedule':
+            cmd.add_argument('--interval',type=int,default=60)
+    discovery_sub.add_parser('status')
+    rollback_table=discovery_sub.add_parser('rollback')
+    rollback_table.add_argument('--db-schema',required=True)
+    rollback_table.add_argument('--table',required=True)
+    abandon_table=discovery_sub.add_parser('abandon')
+    abandon_table.add_argument('--run-id',required=True)
+    abandon_table.add_argument('--force',action='store_true')
     catalog=sub.add_parser('catalog',help='Read-only schema catalog for PostgreSQL or SQL Server')
     catalog_sub=catalog.add_subparsers(dest='catalog_command',required=True)
     for cmd in ('inspect','observe','history'):
@@ -1180,7 +1204,13 @@ def main():
     mu.add_argument('op', choices=['insert','update','hard-delete'])
     mu.add_argument('id', type=int)
     args = parser.parse_args()
-    if args.command == 'initialize':
+    if args.command == 'discover':
+        if (getattr(args,'promotion_timeout',1)<1 or getattr(args,'batch_size',1)<1
+                or getattr(args,'interval',1)<1):
+            parser.error('promotion-timeout, batch-size and interval must be positive')
+        import discovery_sync
+        discovery_sync.command(sys.modules[__name__],args)
+    elif args.command == 'initialize':
         if args.ready_timeout < 1 or args.promotion_timeout < 1:
             parser.error('ready-timeout>=1; promotion-timeout>=1')
         from startup import initialize

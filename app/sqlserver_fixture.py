@@ -42,7 +42,7 @@ def run(action):
                 "status NVARCHAR(30) NOT NULL, description NVARCHAR(MAX) NULL)")
             exec_sql(root,"IF NOT EXISTS(SELECT 1 FROM sys.database_principals "
                 "WHERE name='remote_reader') CREATE USER remote_reader FOR LOGIN remote_reader")
-            exec_sql(root,'GRANT SELECT ON dbo.contracts TO remote_reader')
+            exec_sql(root,'GRANT SELECT ON SCHEMA::dbo TO remote_reader')
             exec_sql(root,"IF NOT EXISTS(SELECT 1 FROM dbo.contracts) "
                 "INSERT INTO dbo.contracts(id,contract_code,amount,status,description) "
                 "SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), "
