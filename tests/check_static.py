@@ -23,6 +23,13 @@ assert 'sha256' in source and 'jsonb_build_array' in source
 assert 'updated_at' not in producer and 'deleted_at' not in producer
 compose=yaml.safe_load((ROOT/'docker-compose.yml').read_text())
 monitor_services=compose['services']
+for service in monitor_services.values():
+    assert service['logging']['driver'] == 'local'
+    assert service['logging']['options'] == {
+        'max-size': '${DOCKER_LOG_MAX_SIZE:-20m}', 'max-file': '${DOCKER_LOG_MAX_FILES:-5}'}
+assert 'stdout' in monitor_services['kafka']['environment']['KAFKA_GC_LOG_OPTS']
+kafka_logging = yaml.safe_load((ROOT/'config/kafka-log4j2.yaml').read_text())
+assert set(kafka_logging['Configuration']['Appenders']) == {'Console'}
 assert 'MONITOR_DSN' in monitor_services['monitor']['environment']
 assert 'LOCAL_DSN' not in monitor_services['monitor']['environment']
 assert 'REMOTE_DSN' not in monitor_services['monitor']['environment']

@@ -16,9 +16,11 @@ rid = '00000000-0000-0000-0000-000000000001'
 class Connection:
     def __init__(self, row=None):
         self.row = row
+        self.rowcount = 0
         self.calls = []
     def __enter__(self): return self
     def __exit__(self, *args): pass
+    def transaction(self): return self
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
         return self

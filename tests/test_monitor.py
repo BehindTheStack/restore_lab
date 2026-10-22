@@ -128,6 +128,22 @@ def test_database_read_failure_is_distinct_from_connection_failure():
     assert 'LOCAL_DB_DOWN' in codes and 'LOCAL_DB_READ_ERROR' not in codes
 
 
+def test_maintenance_results_errors_and_escaping():
+    snap=m.load_snapshot(connect=lambda *a,**kw: DB(),
+        kafka_probe=lambda:{'ok':True,'audit_topic':True,'group':{'members':1,'lag':0}})
+    snap['maintenance']={'settings':{'log_cleanup_enabled':True,
+        'log_cleanup_interval_hours':24,'audit_retention_days':7},
+        'results':{'automatic':{'status':'error','finished_at':
+            (datetime.fromisoformat(snap['checked_at'])-timedelta(days=2)).isoformat(),
+            'removed':{'transitions':3},'errors':[{'error':'<script>bad</script>'}]}}}
+    snap['monitor_cleanup']={'status':'error','error':'<script>projection</script>'}
+    codes={a['code'] for a in m.evaluate(snap)[1]}
+    assert {'LOG_CLEANUP_FAILED','LOG_CLEANUP_OVERDUE','MONITOR_CLEANUP_FAILED'} <= codes
+    markup=m.maintenance_html(snap)
+    assert 'Registros removidos: 3' in markup
+    assert '&lt;script&gt;' in markup and '<script>' not in markup
+
+
 def test_explanations_have_unique_accessible_targets_and_preserve_navigation():
     snap=m.load_snapshot(connect=lambda *a,**kw: DB(),
                          kafka_probe=lambda:{'ok':True,'audit_topic':True,'group':{}})
@@ -178,7 +194,7 @@ def test_permissions_and_protocol():
     assert 'REMOTE_DSN' not in src and 'docker.sock' not in src
     assert 'BEGIN TRANSACTION' not in src and 'UPDATE replica.' not in src
     compose=(root/'docker-compose.yml').read_text()
-    assert '127.0.0.1:8082:8082' in compose
+    assert '127.0.0.1:${MONITOR_HOST_PORT:-8082}:8082' in compose
     core=(root/'app/lab.py').read_text()
     assert "INSERT INTO replica.range_checkpoints" in core
     assert "source_engine':'postgresql'" in core

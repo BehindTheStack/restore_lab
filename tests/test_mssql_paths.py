@@ -19,7 +19,7 @@ assert 'mssql_sync.poll' in lab
 compose=yaml.safe_load((root/'docker-compose.yml').read_text())
 services=compose['services']
 assert services['mssql-cli']['environment']['REMOTE_ENGINE']=='sqlserver'
-assert services['mssql-cli']['environment']['MSSQL_USER']=='remote_reader'
+assert services['mssql-cli']['environment']['MSSQL_USER']=='${MSSQL_USER:-remote_reader}'
 assert 'MSSQL_SA_PASSWORD' not in services['mssql-cli']['environment']
 assert 'MSSQL_SA_PASSWORD' not in services['consumer']['environment']
 assert 'mssql-scheduler' in services
