@@ -1,6 +1,18 @@
 name: kafka-restore-lab
+x-retention-env: &retention-env
+  LOG_RETENTION_DAYS: "${LOG_RETENTION_DAYS:-7}"
+  AUDIT_RETENTION_DAYS: "${AUDIT_RETENTION_DAYS:-7}"
+  KAFKA_RETENTION_DAYS: "${KAFKA_RETENTION_DAYS:-7}"
+  LOG_CLEANUP_ENABLED: "${LOG_CLEANUP_ENABLED:-true}"
+  LOG_CLEANUP_INTERVAL_HOURS: "${LOG_CLEANUP_INTERVAL_HOURS:-24}"
+x-logging: &service-logging
+  driver: local
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-20m}"
+    max-file: "${DOCKER_LOG_MAX_FILES:-5}"
 services:
   remote-db:
+    logging: *service-logging
     image: postgres:17-alpine
     environment:
       POSTGRES_PASSWORD: "${REMOTE_ADMIN_PASSWORD:-lab-admin}"
@@ -18,6 +30,7 @@ services:
 
   # Opt-in SQL Server source for read-only DDL catalog experiments.
   remote-sqlserver:
+    logging: *service-logging
     image: mcr.microsoft.com/mssql/server:2022-latest
     profiles: ["mssql"]
     environment:
@@ -30,6 +43,7 @@ services:
       - mssql_data:/var/opt/mssql
 
   mssql-fixture:
+    logging: *service-logging
     build: ./app
     image: &app-image kafka-restore-lab-app
     profiles: ["mssql-tools"]
@@ -42,6 +56,7 @@ services:
       - remote-sqlserver
 
   local-db:
+    logging: *service-logging
     image: postgres:17-alpine
     environment:
       POSTGRES_PASSWORD: "${LOCAL_ADMIN_PASSWORD:-lab-admin}"
@@ -58,6 +73,7 @@ services:
       retries: 20
 
   kafka:
+    logging: *service-logging
     image: apache/kafka:4.2.2
     hostname: kafka
     ports:
@@ -77,10 +93,14 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG4J_OPTS: '-Dlog4j2.configurationFile=/etc/kafka/lab-log4j2.yaml'
+      KAFKA_GC_LOG_OPTS: '-Xlog:gc*:stdout:time,tags'
     volumes:
       - kafka_data:/var/lib/kafka/data
+      - ./config/kafka-log4j2.yaml:/etc/kafka/lab-log4j2.yaml:ro
 
   toxiproxy:
+    logging: *service-logging
     image: ghcr.io/shopify/toxiproxy:2.13.0
     ports:
       - "127.0.0.1:${TOXIPROXY_HOST_PORT:-8474}:8474"
@@ -89,9 +109,11 @@ services:
         condition: service_healthy
 
   consumer:
+    logging: *service-logging
     build: ./app
     image: *app-image
     environment: &app-env
+      <<: *retention-env
       REMOTE_DSN: "${REMOTE_DSN:-host=toxiproxy port=15432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4}"
       REMOTE_DIRECT_DSN: "${REMOTE_DIRECT_DSN:-host=remote-db port=5432 dbname=lab_remote user=remote_reader password=lab-reader connect_timeout=4}"
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=postgres password=${LOCAL_ADMIN_PASSWORD:-lab-admin} connect_timeout=4"
@@ -110,6 +132,7 @@ services:
         condition: service_started
 
   mssql-cli:
+    logging: *service-logging
     build: ./app
     image: *app-image
     profiles: ["mssql-tools"]
@@ -131,6 +154,7 @@ services:
     command: ["discover", "status"]
 
   mssql-scheduler:
+    logging: *service-logging
     build: ./app
     image: *app-image
     init: true
@@ -153,6 +177,7 @@ services:
       - kafka
 
   cli:
+    logging: *service-logging
     build: ./app
     image: *app-image
     environment: *app-env
@@ -167,6 +192,7 @@ services:
     command: ["discover", "status"]
 
   seed-fixture:
+    logging: *service-logging
     build: ./app
     image: *app-image
     profiles: ["tools"]
@@ -180,6 +206,7 @@ services:
         condition: service_healthy
 
   init:
+    logging: *service-logging
     build: ./app
     image: *app-image
     environment: *app-env
@@ -198,6 +225,7 @@ services:
         condition: service_started
 
   scheduler:
+    logging: *service-logging
     build: ./app
     image: *app-image
     init: true
@@ -217,6 +245,7 @@ services:
 
   # Independent monitor projection; no mirrored business rows.
   monitor-db:
+    logging: *service-logging
     image: postgres:17-alpine
     environment:
       POSTGRES_PASSWORD: "${MONITOR_ADMIN_PASSWORD:-monitor-admin}"
@@ -232,10 +261,12 @@ services:
 
   # The only monitor component that can SELECT local replication audit.
   monitor-collector:
+    logging: *service-logging
     build: ./app
     image: *app-image
     entrypoint: ["python", "-u", "/app/monitor_collect.py"]
     environment:
+      <<: *retention-env
       LOCAL_DSN: "host=local-db port=5432 dbname=lab_local user=monitor_reader password=monitor-reader connect_timeout=3"
       MONITOR_WRITE_DSN: "host=monitor-db port=5432 dbname=lab_monitor user=monitor_writer password=monitor-writer connect_timeout=3"
       KAFKA_BOOTSTRAP: "${KAFKA_BOOTSTRAP:-kafka:19092}"
@@ -253,6 +284,7 @@ services:
 
   # UI reads only its own DB and Kafka metadata; no mirror connection.
   monitor:
+    logging: *service-logging
     build: ./app
     image: *app-image
     entrypoint: ["python", "-u", "/app/monitor.py"]
@@ -288,6 +320,7 @@ services:
       start_period: 20s
 
   kafbat:
+    logging: *service-logging
     image: kafbat/kafka-ui:v1.5.0
     ports:
       - "127.0.0.1:${KAFBAT_HOST_PORT:-8080}:8080"
@@ -299,6 +332,7 @@ services:
       - kafka
 
   adminer:
+    logging: *service-logging
     image: adminer:5
     ports:
       - "127.0.0.1:${ADMINER_HOST_PORT:-8081}:8080"

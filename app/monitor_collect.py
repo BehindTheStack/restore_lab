@@ -8,11 +8,13 @@ import json
 import os
 import signal
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from tempfile import SpooledTemporaryFile
 
 import psycopg
 import monitor
+import retention
 
 
 CATALOG_RUN_SQL = '''SELECT r.run_id::text,t.engine,t.source_schema,t.source_table,
@@ -35,9 +37,12 @@ LEGACY_RUN_KEYS = ('run_id','mode','status','sweep_low','sweep_high','source_cut
 
 
 def documents(source, mode):
-    """Stream all historical evidence, including runs outside the UI's recent 40."""
+    """Stream the audit window plus all unfinished runs, beyond the recent UI 40."""
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=retention.Settings.from_env().audit_retention_days)
     with source.cursor(name='monitor_runs') as cur:
-        cur.execute(CATALOG_RUN_SQL if mode == 'catalog' else LEGACY_RUN_SQL)
+        cur.execute((CATALOG_RUN_SQL if mode == 'catalog' else LEGACY_RUN_SQL) +
+                    " WHERE r.status IN ('loading','extracting') OR r.finished_at IS NULL OR r.finished_at >= %s", (cutoff,))
         keys = CATALOG_RUN_KEYS if mode == 'catalog' else LEGACY_RUN_KEYS
         for row in cur:
             record = {key: monitor._iso(value) for key, value in zip(keys, row)}
@@ -77,6 +82,30 @@ def write_state(target, mode, now, source_status, snapshot=None):
          source_status['ok'], now, json.dumps(source_status)))
 
 
+def cleanup_projection(target, mode, stamp, settings, dry_run=False):
+    row = target.execute('SELECT snapshot FROM monitoring.collection_state WHERE mode=%s', (mode,)).fetchone()
+    previous = ((row[0] or {}).get('monitor_cleanup') or {}) if row else {}
+    if not dry_run and not settings.log_cleanup_enabled:
+        return {**previous, 'status': 'disabled'}
+    if not dry_run and previous.get('finished_at') and previous.get('status') != 'error' and (
+            datetime.fromisoformat(previous['finished_at']) +
+            timedelta(hours=settings.log_cleanup_interval_hours) > stamp):
+        return previous
+    tick = time.monotonic()
+    report = {'finished_at': stamp.isoformat(), 'status': 'dry_run' if dry_run else 'ok',
+              'removed': 0, 'eligible': 0, 'error': None}
+    try:
+        report['eligible' if dry_run else 'removed'] = retention.prune(
+            target, 'monitoring', 'details', """t.mode=%s AND t.kind='run'
+                AND t.document->>'status' NOT IN ('loading','extracting')
+                AND (t.document->>'finished_at')::timestamptz < %s""",
+            (mode, stamp-timedelta(days=settings.audit_retention_days)), dry_run)
+    except Exception as exc:
+        report.update(status='error', error=str(exc)[:500], removed=getattr(exc, 'removed', 0))
+    report['duration_seconds'] = round(time.monotonic()-tick, 3)
+    return report
+
+
 def collect_once(source_dsn, target_dsn, mode, *, connect=psycopg.connect, now=None):
     stamp = now or datetime.now(timezone.utc)
     source_status = {'ok': False, 'connected': False, 'error': None, 'error_code': None}
@@ -90,6 +119,17 @@ def collect_once(source_dsn, target_dsn, mode, *, connect=psycopg.connect, now=N
                 source.execute("SET LOCAL statement_timeout = '10s'")
                 source.execute("SET LOCAL lock_timeout = '2s'")
                 snapshot = monitor._query_db(source, stamp)
+                cutoff = stamp - timedelta(days=retention.Settings.from_env().audit_retention_days)
+                snapshot['recent_runs'] = [r for r in snapshot.get('recent_runs', [])
+                    if r.get('status') in ('loading','extracting') or not r.get('finished_at')
+                    or datetime.fromisoformat(r['finished_at']) >= cutoff]
+                snapshot['latest_run'] = next(iter(snapshot['recent_runs']), None)
+                snapshot['maintenance'] = {'settings': retention.asdict(retention.Settings.from_env()),
+                                           'results': {}}
+                cleanup_table = source.execute("SELECT to_regclass('replica.log_cleanup_state')").fetchone()
+                if cleanup_table and cleanup_table[0]:
+                    snapshot['maintenance']['results'] = dict(source.execute(
+                        'SELECT job,document FROM replica.log_cleanup_state').fetchall())
                 for item in documents(source, mode):
                     spool.write(json.dumps(item, ensure_ascii=False) + '\n')
         except Exception as exc:
@@ -110,6 +150,9 @@ def collect_once(source_dsn, target_dsn, mode, *, connect=psycopg.connect, now=N
                     batch = []
             if batch:
                 write_documents(target, mode, batch)
+            # Projection has no recovery role. Filter at ingestion AND expire
+            # existing documents, so restart cannot resurrect expired evidence.
+            snapshot['monitor_cleanup'] = cleanup_projection(target, mode, stamp, retention.Settings.from_env())
             source_status['ok'] = True
             write_state(target, mode, stamp, source_status, snapshot)
     return True

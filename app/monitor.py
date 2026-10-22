@@ -373,6 +373,21 @@ def evaluate(snapshot):
               'Inspecionar broker e tópico no Kafbat.')
     if store_down or collection_stale or not snapshot['local_db']['ok']:
         return 'unavailable',alarms
+    maintenance = snapshot.get('maintenance') or {}
+    settings = maintenance.get('settings') or {}
+    automatic = (maintenance.get('results') or {}).get('automatic') or {}
+    if automatic.get('status') == 'error':
+        alert('warning', 'LOG_CLEANUP_FAILED', 'Falha na manutenção de retenção',
+              'Consultar Retenção e manutenção e os logs do consumer.')
+    if (snapshot.get('monitor_cleanup') or {}).get('status') == 'error':
+        alert('warning', 'MONITOR_CLEANUP_FAILED', 'Falha na retenção da projeção do monitor',
+              'Consultar Retenção e manutenção e os logs do coletor.')
+    if settings.get('log_cleanup_enabled') and automatic.get('finished_at'):
+        age = (datetime.fromisoformat(snapshot['checked_at']) -
+               datetime.fromisoformat(automatic['finished_at'])).total_seconds()
+        if age > settings['log_cleanup_interval_hours'] * 3600 + 300:
+            alert('warning', 'LOG_CLEANUP_OVERDUE', 'Manutenção de retenção atrasada',
+                  'Conferir o consumer e os erros de conexão da manutenção.')
     a=snapshot.get('active') or {}
     m=snapshot.get('metrics') or {}
     k=(snapshot['kafka'].get('group') or {})
@@ -472,6 +487,36 @@ def load_snapshot(*, now=None, connect=psycopg.connect, kafka_probe=probe_kafka)
         ]
     state['overall'],state['alarms']=evaluate(state)
     return state
+
+
+def maintenance_html(snapshot):
+    maintenance = snapshot.get('maintenance') or {}
+    settings = maintenance.get('settings') or {}
+    results = maintenance.get('results') or {}
+    rows = []
+    for job, label in (('automatic', 'Automática'), ('manual', 'Manual'), ('dry_run', 'Simulação')):
+        result = results.get(job)
+        if not result:
+            continue
+        rows.append(f'<p>{label}: {_date_time(result.get("finished_at"))} · '
+                    f'{_safe(result.get("status"))} · {_safe(result.get("duration_seconds"))} s · '
+                    f'Registros removidos: {_safe(sum(result.get("removed", {}).values()))}</p>'
+                    f'<p>Por tabela: {_safe(result.get("removed") or result.get("eligible"))} · '
+                    f'Kafka: {_safe(result.get("kafka"))}</p>'
+                    f'<p>Erros: {_safe(result.get("errors") or "nenhum")}</p>')
+    projection = snapshot.get('monitor_cleanup') or {}
+    return (f'<section class="section" id="maintenance"><h2>Retenção e manutenção</h2>'
+            f'<p>Limpeza automática: {_safe(settings.get("log_cleanup_enabled"))} · '
+            f'Intervalo: {_safe(settings.get("log_cleanup_interval_hours"))} h · '
+            f'Logs: {_safe(settings.get("log_retention_days"))} dias · '
+            f'Auditoria: {_safe(settings.get("audit_retention_days"))} dias · '
+            f'Kafka: {_safe(settings.get("kafka_retention_days"))} dias</p>'
+            + (''.join(rows) or '<p>Aguardando a primeira manutenção.</p>') +
+            f'<p>Projeção do monitor: {_date_time(projection.get("finished_at"))} · '
+            f'Removidos: {_safe(projection.get("removed"))} · '
+            f'{_safe(projection.get("status"))} · Erro: {_safe(projection.get("error") or "nenhum")}</p>'
+            '<p class="subtle">Estados de recuperação são preservados. Logs Docker giram por tamanho; '
+            'eventos Kafka pendentes ou não confirmados não expiram.</p></section>')
 
 
 HELP = {
@@ -973,6 +1018,7 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 <div class="data"><table><thead><tr><th>ID</th><th>Início · Fortaleza</th><th>Origem</th><th>Modo</th><th>Faixa</th><th>Estado</th><th>Deltas</th><th>Deletes</th><th>Duração</th><th>Erro</th></tr></thead><tbody>
 {row_html or '<tr><td colspan="10">Nenhuma execução registrada</td></tr>'}</tbody></table></div>{runs_nav}</section>
 {ranges_section}
+{maintenance_html(s)}
 <footer><a href="http://localhost:8080/">Kafbat UI</a><a href="http://localhost:8081/">Adminer</a>
 <a href="/status.json">JSON de saúde</a><a href="/readyz">Readiness</a>
 <p>Indicadores operacionais calculados sobre evidências locais e metadados Kafka. Sem sonda ativa à origem,

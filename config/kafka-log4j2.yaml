@@ -1,0 +1,20 @@
+# All broker diagnostics go to Docker's explicitly rotated stdout/stderr.
+# Avoid the image's hourly file appenders, which have no expiry policy.
+Configuration:
+  status: WARN
+  Appenders:
+    Console:
+      name: STDOUT
+      target: SYSTEM_OUT
+      PatternLayout:
+        pattern: "[%d] %p %m (%c)%n"
+  Loggers:
+    Root:
+      level: INFO
+      AppenderRef:
+        ref: STDOUT
+    Logger:
+      - name: kafka.request.logger
+        level: WARN
+      - name: kafka.network.RequestChannel$
+        level: WARN

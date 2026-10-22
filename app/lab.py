@@ -26,6 +26,7 @@ from confluent_kafka import Consumer, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 import schema_evolution as schema_evo
 import source_catalog
+import retention
 
 REMOTE = os.environ['REMOTE_DSN']
 DIRECT = os.environ['REMOTE_DIRECT_DSN']
@@ -76,11 +77,11 @@ def delta_item(id_, op, row):
 
 def kafka_ready():
     admin = AdminClient({'bootstrap.servers': BROKER, 'socket.timeout.ms': 5000})
+    configs = retention.topic_configs(retention.Settings.from_env(), TOPIC, AUDIT_TOPIC)
     for attempt in range(30):
         try:
             topics = [NewTopic(t, num_partitions=1, replication_factor=1,
-                               config={'cleanup.policy': 'delete',
-                                       'retention.ms': '604800000'})
+                               config=configs[t])
                       for t in (TOPIC, AUDIT_TOPIC)]
             for f in admin.create_topics(topics).values():
                 try:
@@ -88,6 +89,7 @@ def kafka_ready():
                 except Exception as exc:
                     if 'TOPIC_ALREADY_EXISTS' not in str(exc):
                         raise
+            retention.configure_topics(admin, configs)
             info = admin.list_topics(topic=TOPIC, timeout=8)
             if len(info.topics[TOPIC].partitions) != 1:
                 raise RuntimeError('V3 demo assumes single topic partition for total ordering')
@@ -783,7 +785,10 @@ def consume():
     import discovery_store
     with psycopg.connect(LOCAL,autocommit=True) as local:
         discovery_store.ensure_schema(local)
+        retention.ensure_schema(local)
     kafka_ready()
+    cleanup_stopping = retention.start_worker(LOCAL, lambda: AdminClient({
+        'bootstrap.servers': BROKER, 'socket.timeout.ms': 5000}), TOPIC, log)
     while True:
         c = Consumer({'bootstrap.servers': BROKER,
                       'group.id': 'lab-range-bluegreen-v4',
@@ -816,6 +821,7 @@ def consume():
             time.sleep(3)
         finally:
             c.close()
+    cleanup_stopping.set()
 
 
 def rollback():
@@ -1140,6 +1146,9 @@ def main():
     incremental.add_argument('--throttle-ms', type=int, default=0)
     sub.add_parser('consume')
     sub.add_parser('status')
+    cleanup_cmd = sub.add_parser('cleanup', help='Safely expire disposable audit and acknowledged Kafka events')
+    cleanup_cmd.add_argument('--dry-run', action='store_true')
+    cleanup_cmd.add_argument('--status', action='store_true')
     discovery=sub.add_parser('discover',help='Discover and reconcile all SELECT-accessible source tables')
     discovery_sub=discovery.add_subparsers(dest='discovery_command',required=True)
     for name in ('init','once','schedule'):
@@ -1204,7 +1213,20 @@ def main():
     mu.add_argument('op', choices=['insert','update','hard-delete'])
     mu.add_argument('id', type=int)
     args = parser.parse_args()
-    if args.command == 'discover':
+    if args.command == 'cleanup':
+        settings = retention.Settings.from_env()
+        with psycopg.connect(LOCAL, autocommit=True) as conn:
+            retention.ensure_schema(conn)
+            if args.status:
+                rows = conn.execute('SELECT job,document FROM replica.log_cleanup_state ORDER BY job').fetchall()
+                log('log_cleanup_status', settings=retention.asdict(settings), results=dict(rows))
+            else:
+                report = retention.cleanup(conn, settings, dry_run=args.dry_run, topic=TOPIC,
+                    admin=AdminClient({'bootstrap.servers': BROKER, 'socket.timeout.ms': 5000}))
+                log('log_cleanup', **report)
+                if report.get('errors'):
+                    raise SystemExit(1)
+    elif args.command == 'discover':
         if (getattr(args,'promotion_timeout',1)<1 or getattr(args,'batch_size',1)<1
                 or getattr(args,'interval',1)<1):
             parser.error('promotion-timeout, batch-size and interval must be positive')
