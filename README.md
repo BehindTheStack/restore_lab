@@ -202,6 +202,8 @@ O scheduler SQL Server é opcional e deve ser iniciado depois de `discover init`
 
 O painel mantém o cabeçalho com fluxo, horário de Fortaleza e atualização a cada 20 segundos. Os ícones `?` explicam cada indicador ao passar o mouse, tocar ou focar pelo teclado. As tabelas exibem **10 registros por página**, com total, primeira/anterior/próxima/última página. Cada tabela mantém sua própria navegação; a atualização automática preserva a URL selecionada. Os históricos apresentados continuam limitados às observações recentes carregadas pelo painel: 40 execuções e 20 observações de schema/faixas.
 
+Os blocos de acompanhamento distinguem a leitura da origem da entrega das mensagens. O primeiro mostra o resultado registrado, a tabela, a data e o link para as evidências; o segundo explica se a fila está em dia, aguardando confirmação, reorganizando consumidores ou sem consumer ativo. Brokers, partições e estado interno do grupo ficam em **Detalhes técnicos do Kafka**, recolhidos durante a operação normal e abertos automaticamente diante de falhas ou atraso acima do limite. A atividade da extração é uma evidência histórica, sem sonda direta de conectividade à origem.
+
 | Indicador | Significado |
 | --- | --- |
 | Última promoção | Tempo desde a última publicação validada de alguma tabela; não mede disponibilidade da origem. |
@@ -213,6 +215,8 @@ O painel mantém o cabeçalho com fluxo, horário de Fortaleza e atualização a
 | Catálogo de tabelas | Origem, view de destino, estado, linhas da última geração, slot, hash do schema, última conferência e erro. |
 
 Uma tabela com falha mantém a última publicação válida e pode continuar contando na cobertura se foi conferida dentro da janela. Confira também o estado e a data: cobertura não substitui os alertas. No modo legado, a cobertura continua medindo faixas numéricas de PK, e usa o rótulo correspondente.
+
+Os nomes das tabelas de origem abrem um modal com o DDL reconstruído do catálogo observado. Nas execuções, o DDL corresponde ao contrato registrado no lote. Os IDs abrem as evidências em modal, com navegação de volta ao lote, fechamento por Esc e preservação da página selecionada. A atualização automática pausa enquanto um modal está aberto. A reconstrução não substitui um dump completo: propriedades não registradas, como índices, FKs ou parâmetros de identidade, podem estar ausentes.
 
 O monitor só lê auditoria local como `monitor_reader` e metadados Kafka. Não participa do grupo consumer nem acessa a origem. `/status.json` expõe os indicadores; `/run/<uuid>` mostra evidências do lote; `/healthz` informa que o processo HTTP está vivo; `/readyz` verifica leitura local e tópico Kafka, sem certificar igualdade entre bases.
 
@@ -253,7 +257,9 @@ Parâmetros do serviço `monitor`:
 | `app/discovery_catalog.py` | Catálogos PostgreSQL/SQL Server, permissões observáveis, identificadores, mapeamento de tipos e leitura consistente. |
 | `app/discovery_sync.py` | Orquestra descoberta, comparação, publicação, espera da promoção e scheduler. |
 | `app/discovery_store.py` | Schema local automático, staging por tabela, views tipadas, slots, journal, promoção, retirada e rollback. |
-| `app/monitor.py` | Consultas de auditoria, alertas, renderização HTML, paginação e tooltips. |
+| `app/monitor.py` | Consultas de auditoria, alertas, HTML, paginação e endpoints dos detalhes. |
+| `app/monitor_details.py` | Reconstrução do DDL observado e apresentação segura dos detalhes das execuções. |
+| `app/monitor_ui.js` | Modais acessíveis, consulta dos detalhes e pausa da atualização durante a leitura. |
 | `app/startup.py` | Inicialização compatível com o fluxo legado de contratos. |
 | `app/schema_evolution.py` | Planejamento, aprovação e backfill de schema no fluxo legado. |
 | `app/source_catalog.py` | Observador explícito de um objeto no catálogo legado. |
@@ -320,6 +326,7 @@ Testes offline, sem bancos ou Kafka:
 python3 tests/check_static.py
 python3 tests/test_discovery_catalog.py
 python3 tests/test_monitor.py
+python3 tests/test_monitor_modals.py
 python3 tests/test_startup.py
 python3 tests/test_reconcile.py
 python3 tests/test_generation_paths.py
@@ -341,5 +348,7 @@ LAB_DISCOVERY_TEST=1 LAB_DISCOVERY_ENGINE=sqlserver bash tests/e2e_discovery.sh
 O teste valida início padrão, recusa de escrita pela conta SELECT, descoberta, INSERT/UPDATE/DELETE, rollback compatível, guarda de exclusão, ADD/ALTER COLUMN, bloqueio de rollback incompatível, PK composta, tabela sem PK, DROP seguro, evidências HTTP e paginação. O teste SQL Server desabilita SNAPSHOT na fixture para exercitar o fallback SERIALIZABLE sem permissão administrativa no produtor. Os recursos e volumes criados pelo teste são removidos ao terminar.
 
 Para conferir promoção idempotente, limpeza de lotes abortados e distinção entre SELECT negado e catálogo ausente no armazenamento local, execute `docker compose exec -T -e LAB_DISCOVERY_STORE_TEST=1 consumer python - < tests/test_discovery_store_live.py`. Esse teste cria objetos dentro de uma transação e desfaz tudo com ROLLBACK; não acessa a origem.
+
+Com o monitor inicializado e Playwright instalado no ambiente de testes, `LAB_MONITOR_BROWSER_TEST=1 node tests/e2e_monitor_modals.cjs` verifica os modais no navegador: teclado, foco, DDL histórico, navegação de volta, pausa da atualização, paginação e layout móvel. `LAB_MONITOR_URL` permite escolher outra instância; `PLAYWRIGHT_CHROMIUM_EXECUTABLE` permite indicar o navegador instalado.
 
 Os demais scripts `tests/e2e_*.sh` mantêm experimentos específicos do fluxo legado. Leia a condição de ativação de cada script antes de executá-lo. `tests/e2e_startup.sh` verifica a compatibilidade da inicialização antiga; `tests/e2e_discovery.sh` verifica o caminho padrão atual.
