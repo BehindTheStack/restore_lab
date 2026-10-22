@@ -4,11 +4,10 @@ Laboratório de descoberta e reconciliação de tabelas de uma origem PostgreSQL
 
 ```bash
 cp .env.example .env
-cp .env.local.example .env.local
 docker compose up -d --build
 ```
 
-Faça as cópias apenas na primeira configuração, preservando arquivos locais já existentes. `.env` contém os padrões do laboratório; `.env.local` começa apenas com exemplos comentados de sobrescritas. Veja [Arquivos de ambiente](#arquivos-de-ambiente) para aplicar essas sobrescritas.
+Faça a cópia apenas na primeira configuração, preservando um `.env` já existente. Edite esse arquivo para ajustar os padrões do laboratório. Veja [Arquivos de ambiente](#arquivos-de-ambiente).
 
 Esse comando inicia o cenário PostgreSQL, prepara o proxy, descobre as tabelas, publica o bootstrap das tabelas ainda não inicializadas, aguarda a promoção pelo consumer e inicia o scheduler. O monitor faz parte do conjunto padrão: [localhost:8082](http://localhost:8082).
 
@@ -16,25 +15,23 @@ Os bancos de origem do Compose são fixtures com dados fictícios. A reconcilia�
 
 ## Arquivos de ambiente
 
-O Compose interpola as variáveis de `.env` no `docker-compose.yml` e envia a cada serviço apenas as entradas declaradas no seu `environment`. Não há carregamento de dotenv pelo Python. O YAML mantém os valores padrão, permitindo iniciar as fixtures mesmo sem os arquivos locais.
+O Compose interpola as variáveis de `.env` no `docker-compose.yml` e envia a cada serviço apenas as entradas declaradas no seu `environment`. Não há carregamento de dotenv pelo Python. O YAML mantém os valores padrão, permitindo iniciar as fixtures mesmo sem o arquivo local.
 
 | Arquivo | Uso |
 | --- | --- |
 | `.env.example` | Modelo versionado dos padrões de portas, credenciais das fixtures, sincronização e monitoramento. |
 | `.env` | Configuração local lida automaticamente pelo Compose; ignorada pelo Git. |
-| `.env.local.example` | Modelo versionado de sobrescritas opcionais, inicialmente comentadas. |
-| `.env.local` | Sobrescritas da máquina, ignoradas pelo Git; exigem os argumentos `--env-file`. |
 
-Para usar `.env.local`, informe os dois arquivos, nessa ordem, em **todos os comandos** da instância personalizada:
+Toda a configuração local fica em `.env`, sem argumentos adicionais nos comandos:
 
 ```bash
-docker compose --env-file .env --env-file .env.local config --quiet
-docker compose --env-file .env --env-file .env.local up -d --build
-docker compose --env-file .env --env-file .env.local run --rm cli discover status
-docker compose --env-file .env --env-file .env.local logs --tail 30 scheduler consumer
+docker compose config --quiet
+docker compose up -d --build
+docker compose run --rm cli discover status
+docker compose logs --tail 30 scheduler consumer
 ```
 
-O segundo arquivo sobrescreve o primeiro. Variáveis já exportadas no shell têm prioridade sobre ambos. Os demais exemplos deste README usam `docker compose` com `.env`; acrescente os dois `--env-file` se estiver usando sobrescritas. Os arquivos são de configuração do Compose, com nomes de serviços da rede Docker; não são um ambiente para executar a aplicação diretamente no host.
+Variáveis já exportadas no shell têm prioridade sobre `.env`. O arquivo configura o Compose, com nomes de serviços da rede Docker; não é um ambiente para executar a aplicação diretamente no host.
 
 | Configuração | Variáveis |
 | --- | --- |
@@ -49,7 +46,7 @@ As portas internas permanecem fixas. Por exemplo, `MONITOR_HOST_PORT=8182` muda 
 
 As senhas fornecidas são públicas e exclusivas das fixtures descartáveis. Os nomes dos bancos e as contas de leitura/escrita provisionadas continuam definidos em `sql/remote.sql`, `sql/local.sql`, `sql/monitor.sql` e `app/sqlserver_fixture.py`. Alterar `MSSQL_PASSWORD` muda a conexão, sem alterar a senha do login na origem. Alterar uma senha administrativa em `.env` também não muda a senha já gravada num volume: atualize a conta no banco antes de recriar os serviços com o novo valor. `LOCAL_ADMIN_PASSWORD` alimenta tanto `local-db` quanto as conexões administrativas da aplicação.
 
-`REMOTE_DSN` e `REMOTE_DIRECT_DSN` podem sobrescrever as conexões PostgreSQL completas; os exemplos estão em `.env.local.example`. O proxy `remote_pg` é criado com upstream `remote-db:5432`: alterar o DSN direto não reconfigura esse proxy. As credenciais administrativas da origem continuam restritas ao banco e aos serviços de fixture; o produtor recebe somente as credenciais SELECT da origem.
+`REMOTE_DSN` e `REMOTE_DIRECT_DSN` podem sobrescrever as conexões PostgreSQL completas; os exemplos estão em `.env.example` e podem ser definidos em `.env`. O proxy `remote_pg` é criado com upstream `remote-db:5432`: alterar o DSN direto não reconfigura esse proxy. As credenciais administrativas da origem continuam restritas ao banco e aos serviços de fixture; o produtor recebe somente as credenciais SELECT da origem.
 
 Depois de editar a configuração, use `docker compose config --quiet` para validar e `docker compose up -d` para recriar os serviços afetados. `restart` não carrega novas variáveis. A forma sem `--quiet` exibe a configuração resolvida, incluindo senhas.
 
@@ -328,7 +325,7 @@ Parâmetros exclusivos de `monitor-collector`: `LOCAL_DSN` é a conexão SELECT 
 
 | Arquivo | Responsabilidade |
 | --- | --- |
-| `.env.example` / `.env.local.example` | Modelos versionados da configuração do Compose e das sobrescritas locais. |
+| `.env.example` | Modelo versionado da configuração local do Compose. |
 | `app/.dockerignore` | Exclusões do contexto de build `./app`. |
 | `app/lab.py` | CLI, transporte Kafka, consumer e integração com o fluxo legado. |
 | `app/discovery_catalog.py` | Catálogos PostgreSQL/SQL Server, permissões observáveis, identificadores, mapeamento de tipos e leitura consistente. |
@@ -382,7 +379,7 @@ Os comandos abaixo usam a origem PostgreSQL padrão. Para SQL Server, substitua 
    docker compose stop scheduler
    ```
 
-3. Em `.env` (ou `.env.local`, se estiver usando os dois `--env-file`), localize `MAX_REMOVE_FRACTION`, anote o valor anterior e ajuste apenas essa variável. Use um limite que comporte a proporção revisada; por exemplo, para remover 40%:
+3. Em `.env`, localize `MAX_REMOVE_FRACTION`, anote o valor anterior e ajuste apenas essa variável. Use um limite que comporte a proporção revisada; por exemplo, para remover 40%:
 
    ```dotenv
    MAX_REMOVE_FRACTION=0.50

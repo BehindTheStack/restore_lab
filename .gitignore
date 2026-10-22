@@ -8,11 +8,10 @@ venv/
 .coverage
 htmlcov/
 
-# Configuração local e credenciais; os modelos permanecem versionáveis.
+# Configuração local e credenciais; o modelo permanece versionável.
 .env
 .env.*
 !.env.example
-!.env.local.example
 
 *.log
 .vscode/
