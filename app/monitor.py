@@ -643,6 +643,22 @@ def table_page(rows, key, anchor, pages, label):
     return rows[start:start+PAGE_SIZE],nav
 
 
+def _date_time(value):
+    if not value:
+        return '—'
+    stamp=datetime.fromisoformat(value) if isinstance(value,str) else value
+    if stamp.tzinfo is None:
+        stamp=stamp.replace(tzinfo=timezone.utc)
+    label=stamp.astimezone(timezone(timedelta(hours=-3))).strftime('%d/%m/%Y às %H:%M:%S')
+    return f'<time datetime="{_safe(stamp.isoformat())}" title="Horário de Fortaleza (UTC−03)">{label}</time>'
+
+
+def _detail_value(key, value):
+    if key in ('started_at','finished_at','source_cutoff'):
+        return _date_time(value)
+    return f'<code>{_safe(value)}</code>'
+
+
 def render_html(s, pages=None):
     pages=page_numbers({k:[str(v)] for k,v in (pages or {}).items()})
     a=s.get('active') or {}; k=s.get('kafka') or {}; group=k.get('group') or {}
@@ -654,11 +670,6 @@ def render_html(s, pages=None):
     page_catalog,schema_nav=table_page(catalog,'schema_page','schema',pages,'Paginação dos schemas observados')
     page_tables,tables_nav=table_page(s.get('tables',[]),'tables_page','tables',pages,'Paginação das tabelas e réplicas')
     page_ranges,ranges_nav=table_page(s.get('last_ranges') or [],'ranges_page','ranges',pages,'Paginação das faixas promovidas')
-    checked_at=datetime.fromisoformat(s['checked_at'])
-    if checked_at.tzinfo is None:
-        checked_at=checked_at.replace(tzinfo=timezone.utc)
-    local_reading=checked_at.astimezone(timezone(timedelta(hours=-3)))
-    reading_label=local_reading.strftime('%d/%m/%Y às %H:%M:%S')
     state_label={'operational':'Serviços prontos · leituras por tabela' if automatic else 'Serviços prontos · integridade por faixas',
                  'attention':'Atenção operacional','not_initialized':'Bootstrap pendente',
                  'unavailable':'Falha operacional'}[s['overall']]
@@ -675,6 +686,7 @@ def render_html(s, pages=None):
     cover_state='good' if c.get('status')=='complete' else 'unknown'
     sc_state=('warning' if s.get('table_error_count') else 'good') if automatic else ('warning' if schema.get('pending_hash') else ('good' if schema.get('active_hash') else 'unknown'))
     row_html=''.join(f'''<tr><td><a href="/run/{_safe(r['id'])}"><code>{_safe(r['id'][:8])}</code></a></td>
+        <td class="run-date">{_date_time(r.get('started_at'))}</td>
         <td>{_safe((r.get('object')+' · ' if r.get('object') else '')+str(r['engine']))}</td><td>{_safe(r['mode'])}</td>
         <td>{_safe(str(r['low'])+'–'+str(r['high']) if r['low'] is not None else 'tabela inteira' if automatic else 'bootstrap')}</td>
         <td><span class="tag">{_safe(r['status'])}</span></td>
@@ -686,10 +698,10 @@ def render_html(s, pages=None):
          <small>{_safe(x['action'])}</small></div>''' for x in s['alarms'])
     ranges=''.join(f'''<tr><td><a href="/run/{_safe(x['run_id'])}">{_safe(x['run_id'][:8])}</a></td>
         <td>{_safe(x['engine'])}</td><td>{_safe(x['low'])}–{_safe(x['high'])}</td>
-        <td>{_safe(x['target_max_id'])}</td><td>{_safe(x['at'])}</td></tr>'''
+        <td>{_safe(x['target_max_id'])}</td><td>{_date_time(x['at'])}</td></tr>'''
         for x in page_ranges)
     catalogs=''.join(f'<tr><td>{_safe(x["source"])}</td><td>{_safe(x["engine"])}</td>'
-        f'<td>{_safe(x["classification"])}</td><td>{_safe(x["observed_at"])}</td></tr>'
+        f'<td>{_safe(x["classification"])}</td><td>{_date_time(x["observed_at"])}</td></tr>'
         for x in page_catalog)
     gaps=', '.join(f'{lo}–{hi}' for lo,hi in c.get('gaps',[])) or '—'
     stages=''.join([
@@ -729,7 +741,7 @@ def render_html(s, pages=None):
     table_rows=''.join(f'''<tr><td>{_safe(t['engine'])} · {_safe(t['schema'])}.{_safe(t['table'])}</td>
         <td><code>{_safe(t['destination_schema'])}.{_safe(t['destination_table'])}</code></td>
         <td>{_safe(t['status'])}</td><td>{_safe(t['rows'])}</td><td>{_safe(t['generation'])} · {_safe(t['slot'])}</td>
-        <td><code>{_safe((t['schema_hash'] or '')[:12])}</code></td><td>{_safe(t['checked_at'])}</td>
+        <td><code>{_safe((t['schema_hash'] or '')[:12])}</code></td><td>{_date_time(t['checked_at'])}</td>
         <td>{_safe(t['error'])}</td></tr>''' for t in page_tables)
     table_section=('''<section class="section" id="tables"><h2>Catálogo de tabelas e réplicas</h2>
         <p>Descoberta por SELECT · leituras consistentes por tabela · views em mirror_&lt;schema&gt;.
@@ -799,6 +811,7 @@ h1{{font-size:27px;margin:3px 0 7px}}h2{{font-size:17px;margin:0 0 13px}}p{{colo
 .pagination div{{display:flex;gap:7px;align-items:center;flex-wrap:wrap}}.pagination a,.pagination [aria-current]{{padding:6px 9px;border:1px solid var(--line);border-radius:7px;text-decoration:none;background:var(--paper)}}
 .pagination [aria-current]{{background:#edf2f8;color:var(--ink)}}.pagination a:focus-visible{{outline:2px solid var(--link);outline-offset:2px}}
 th,td{{border-bottom:1px solid var(--line);padding:11px 9px;vertical-align:top;font-size:12px}}th{{color:var(--muted);font-weight:600}}
+.run-date{{white-space:nowrap;font-variant-numeric:tabular-nums}}
 .tag{{border-radius:8px;background:#edf2f8;padding:4px 7px}}.alert{{border:1px solid #edcf98;border-radius:9px;padding:10px 12px;margin:8px 0;background:#fffaf0}}
 .alert.critical{{border-color:#e9a1a5;background:#fff3f4}}.alert span{{display:block;margin:5px 0}}.alert small{{color:var(--muted)}}
 code{{font:12px ui-monospace,monospace}}.meter{{height:10px;background:#e7edf3;border-radius:20px;margin:14px 0;overflow:hidden}}
@@ -819,7 +832,7 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 <li><span class="pipeline-arrow" aria-hidden="true">→</span>{_pipeline_node('PostgreSQL blue-green','blue-green')}</li>
 </ol>
 <div class="header-meta">
-<span class="reading has-help">Última leitura <time datetime="{_safe(s['checked_at'])}">{_safe(reading_label)}</time><small>UTC−03 · Fortaleza</small>{_help('last-reading')}</span>
+<span class="reading has-help">Última leitura {_date_time(s['checked_at'])}<small>UTC−03 · Fortaleza</small>{_help('last-reading')}</span>
 <span class="refresh has-help"><span class="refresh-dot" aria-hidden="true"></span>Atualização automática · a cada 20 segundos{_help('refresh')}</span>
 </div></div>
 <div class="state has-help">{_safe(state_label)}{_help('overall')}</div></header>
@@ -849,7 +862,7 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 <div class="columns"><section class="section" id="destination"><h2>Destino e blue-green</h2>
 {('<p class="alert critical">' + _safe(s['local_db'].get('error')) + '</p>') if s['local_db'].get('error') else ''}
 <div class="facts">{destination_facts}</div>
-<p>Última transição: {_safe(last.get('action'))} · {_safe(last.get('at'))} · Versão {_safe(last.get('version'))}</p>
+<p>Última transição: {_safe(last.get('action'))} · {_date_time(last.get('at'))} · Versão {_safe(last.get('version'))}</p>
 <p class="subtle">A versão ativa é transacional; rollback exige compatibilidade do schema e journal disponível.</p>
 </section><section class="section" id="schema"><h2>DDL e catálogo de schemas</h2>
 <p>{'Contratos independentes por tabela; consulte os hashes e os destinos no catálogo.' if automatic else 'Contrato ativo: <code>'+_safe((schema.get('active_hash') or '')[:20])+'</code>'}</p>
@@ -866,8 +879,8 @@ footer{{font-size:12px;color:var(--muted);line-height:1.7;padding:18px 0}}footer
 </section>
 {table_section}
 <section class="section" id="runs"><h2>Últimas execuções · clique no ID para evidências</h2>
-<div class="data"><table><thead><tr><th>ID</th><th>Origem</th><th>Modo</th><th>Faixa</th><th>Estado</th><th>Deltas</th><th>Deletes</th><th>Duração</th><th>Erro</th></tr></thead><tbody>
-{row_html or '<tr><td colspan="9">Nenhuma execução registrada</td></tr>'}</tbody></table></div>{runs_nav}</section>
+<div class="data"><table><thead><tr><th>ID</th><th>Início · Fortaleza</th><th>Origem</th><th>Modo</th><th>Faixa</th><th>Estado</th><th>Deltas</th><th>Deletes</th><th>Duração</th><th>Erro</th></tr></thead><tbody>
+{row_html or '<tr><td colspan="10">Nenhuma execução registrada</td></tr>'}</tbody></table></div>{runs_nav}</section>
 {ranges_section}
 <footer><a href="http://localhost:8080/">Kafbat UI</a><a href="http://localhost:8081/">Adminer</a>
 <a href="/status.json">JSON de saúde</a><a href="/readyz">Readiness</a>
@@ -924,7 +937,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(400,'Invalid UUID');return
                 if data is None:self.send_error(404,'Run not found');return
                 obj='<h1>Execução '+_safe(data['run_id'])+'</h1><p><a href="/">← Painel</a></p>'
-                obj+='<table>'+''.join(f'<tr><th>{_safe(key)}</th><td><code>{_safe(val)}</code></td></tr>' for key,val in data.items())+'</table>'
+                obj+='<table>'+''.join(f'<tr><th>{_safe(key)}</th><td>{_detail_value(key,val)}</td></tr>' for key,val in data.items())+'</table>'
                 body='<!doctype html><html lang="pt-BR"><meta charset="utf-8"><title>Execução</title><body style="font:14px system-ui;max-width:900px;margin:30px auto">'+obj+'</body></html>'
                 self._send(200,'text/html; charset=utf-8',body);return
             snapshot=load_snapshot()
